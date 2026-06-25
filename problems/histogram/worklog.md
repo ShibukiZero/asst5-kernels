@@ -111,3 +111,43 @@ Conclusion / lesson:
 
 ---
 
+### Entry 2 — Fused CUDA kernel, coalesced read, global atomics
+
+Date: 2026-06-24
+
+Thinking: read the original array once in row-major order so a warp's 32 threads read 32 consecutive channels (coalesced), and scatter counts with `atomicAdd` to a global `[channels, bins]` histogram — no transpose, no per-channel loop. Read-once is guaranteed by a bijection: each `(row, channel)` is handled by exactly one thread in one loop iteration.
+
+Code version:
+- `submission.cu` (compiled via `load_inline`). One `__global__ hist_kernel`:
+  - `c = blockIdx.x*blockDim.x + threadIdx.x` → channel (consecutive threads → consecutive channels → coalesced).
+  - grid-stride over rows: `for (r = blockIdx.y; r < length; r += gridDim.y)`.
+  - `atomicAdd(&hist[c*num_bins + v], 1)` into the global histogram.
+  - Launch: `block=256`, `grid=(ceil(512/256)=2, 2048)` → 4096 blocks, ~1.05M threads.
+
+Command: `./run.sh histogram test|benchmark|profile`
+
+Correctness: **pass**
+
+Performance:
+- **Runtime: 6.770 ms** (mean of 3) → **7.6× over baseline** (51.31 → 6.77 ms), 6.7× over the transpose version.
+
+Profiler stats (`hist_kernel`, 6.85 ms):
+
+| Metric | Value | Meaning |
+|--------|-------|---------|
+| **DRAM_Read** | **512.65 MB** | array read **exactly once** (was 68 GB) — 135× traffic gone |
+| DRAM_Throughput | **2.35%** | DRAM now idle → **no longer memory-bound** |
+| **L1→L2 Traffic** | **16.00 GB** | the global atomics |
+| L2_Cache_Throughput | **88%** | **L2 is the new bottleneck** |
+| L2_Cache_Hit_Rate | 97.7% | the 512 KB histogram lives in L2 |
+| Compute_Throughput | 12.9% | compute idle too |
+
+Observation:
+- Both Entry-0 predictions confirmed: (1) reading once collapses DRAM traffic to the 512 MiB minimum and drops DRAM throughput to ~2%; (2) the new wall is **global-atomic traffic** — 537M `atomicAdd`s generate 16 GB of L1↔L2 traffic and saturate L2 (88%). The 6.85 ms is spent waiting on L2 atomics, not reading data (DRAM at 2.35% ⇒ the same 512 MB could stream in ~160 µs if not gated by atomics).
+- Still ~42× off the ~160 µs roofline; the entire gap is atomics.
+
+Hypothesis / next step:
+- Privatize: each block accumulates a sub-histogram in **shared memory** (on-chip, ~100× faster than L2 atomics, no L2 traffic), then flushes once per bin to global. Should remove most of the 16 GB L2 traffic and return to DRAM-bound. Constraint: full 512 KB histogram > 228 KB shared/SM ⇒ tile over channels.
+
+---
+
