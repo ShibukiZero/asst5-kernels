@@ -151,3 +151,44 @@ Hypothesis / next step:
 
 ---
 
+### Entry 3 — Shared-memory privatized sub-histograms (channel-tiled)
+
+Date: 2026-06-24
+
+Thinking: move the 537M atomics off L2 (the v2 wall) onto on-chip shared memory. Each block owns CH=32 channels and keeps a private `[CH x BINS]` sub-histogram in shared mem (32 KB, fits the per-block limit); threads accumulate with shared-mem atomics, then flush once to global. Coalesced global load preserved (warp = 32 consecutive channels of a row).
+
+Code version (`submission.cu`):
+- `__shared__ int s[CH*BINS]` with `CH=32, BINS=256` (32 KB/block).
+- block `(CH, 16)` = 512 threads (x=local channel, y=row-lane); grid `(num_channels/CH, 128)` = `(16,128)` = 2048 blocks.
+- zero shared → accumulate `atomicAdd(&s[lc*num_bins+v],1)` (grid-stride rows) → `__syncthreads()` → flush `atomicAdd(&hist[gc*num_bins+bin], s[...])`.
+
+Command: `./run.sh histogram test|benchmark|profile`
+
+Correctness: **pass**
+
+Performance:
+- **Runtime: 0.816 ms** (mean of 5) → **63× over baseline** (51.31 → 0.816 ms), **8.3× over v2** (6.77 ms). Now ~5× off the ~160 µs roofline.
+
+Profiler stats (`hist_kernel`, 856 µs):
+
+| Metric | Value | Meaning |
+|--------|-------|---------|
+| DRAM_Read | 514 MB | still read **once** ✓ |
+| **L1→L2 Traffic** | **64 MB** | was 16 GB — global atomics gone (250× less) ✓ |
+| DRAM_Throughput | 18.9% | up from 2.35%, still not saturated |
+| L2 / L1 / Compute thru | 34% / 43% / 35% | **nothing saturated** |
+| **Achieved occupancy** | **95.3%** | occupancy is NOT the limiter |
+| **Shared-atomic bank conflicts** | **42.6 M** | ← suspected bottleneck — **WRONG**, disproven in Entry 4 |
+
+Observation:
+- Shared-memory privatization worked: L2 traffic collapsed 16 GB → 64 MB; L2 no longer the wall.
+- But no resource is saturated (all 19–43%) **despite 95% occupancy** ⇒ warps are resident but **stalled**, not starved. The cause is **shared-memory bank conflicts** (42.6 M): `s[lc*256 + v]` has bank = `(lc*256+v) mod 32` = `v mod 32` — independent of `lc`, so a warp's 32 threads (varied values) collide heavily, serializing the shared atomics.
+
+Hypothesis / next step (v4):
+- Pad the per-channel stride 256 → 257: `s[lc*257 + v]` ⇒ bank = `(lc+v) mod 32` (257 mod 32 = 1). A warp's lc = 0..31 then spreads across all 32 banks regardless of value → conflict-free. Shared cost 32 KB → 32.1 KB (negligible). Re-measure bank conflicts and whether we become DRAM-bound.
+- If same-address atomic contention (row-lanes hitting the same `(lc,v)`) shows up next, consider replicated sub-histograms.
+
+> ⚠️ **Correction (after Entry 4):** the "bank conflicts are the bottleneck" attribution above was **wrong** — inferred from a nonzero metric without measuring warp stall reasons. Padding (Entry 4) disproved it; the real bottleneck is global-load latency. Kept here to show the (mistaken) reasoning at the time.
+
+---
+
