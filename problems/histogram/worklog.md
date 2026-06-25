@@ -192,3 +192,52 @@ Hypothesis / next step (v4):
 
 ---
 
+### Entry 4 — Bank-conflict padding (256 → 257) — NO EFFECT (failed)
+
+Date: 2026-06-24
+
+Thinking: pad shared stride to 257 to make bank = `(lc+v) mod 32`, expecting conflict-free shared atomics.
+
+Code version (`submission.cu`): `SPADC = BINS+1 = 257`; `s[lc*spad + v]`; shared 32 KB → 32.1 KB. Everything else identical to Entry 3.
+
+Correctness: **pass**
+
+Performance:
+- **Runtime: 0.813 ms** (mean of 5) — **unchanged** from Entry 3 (0.816 ms).
+
+Profiler stats:
+
+| Metric | Entry 3 | Entry 4 (padded) |
+|--------|---------|------------------|
+| Shared-atomic bank conflicts | 42.6 M | **42.99 M (unchanged)** |
+| Achieved occupancy | 95.3% | 95.7% |
+| DRAM / L1 / SM throughput | 19/43/35% | 19/44/34% |
+| Duration | 856 µs | 852 µs |
+
+Why it failed (the lesson):
+- My padding reasoning assumed all threads in a warp write the **same** value v (then bank = `(lc+v)%32` is a perfect permutation). But the data is **uniform-random**: each lane's `v_lc` is independent → bank = `(lc+v_lc)%32` is still random → **same conflict rate**. **Padding only removes bank conflicts for correlated/identical writes; for random values it does nothing.**
+- More importantly, padding moving the runtime by ~0 shows **bank conflicts were never the real bottleneck** (42.6 M conflicts is only ~8% of the 537 M shared atomics; the Entry-3 hypothesis was wrong).
+
+Re-diagnosis attempt #1 (ALSO WRONG): I then guessed "raw shared-atomic throughput" — again from indirect signals, without measuring. Disproven below.
+
+Re-diagnosis #2 — measured warp stall reasons (the *direct* signal):
+
+| Stall reason (per issued inst) | Value |
+|--------------------------------|-------|
+| **long_scoreboard** (waiting on global-memory load) | **38.0** ← dominant |
+| barrier (`__syncthreads`) | 0.58 |
+| short_scoreboard (shared memory) | 0.13 |
+| **mio_throttle** (shared-atomic / MIO pipe) | **0.01** |
+| lg_throttle | 0 |
+| issue_active (warps actually issuing) | 34.6% |
+
+**True bottleneck: global-load latency (latency-bound).** `mio_throttle ≈ 0` proves shared atomics are NOT the limiter; `short_scoreboard ≈ 0` rules out shared memory / bank conflicts; DRAM at 19% rules out bandwidth. Warps stall on `long_scoreboard` because each thread does **1-byte load → dependent atomicAdd → …**: memory-level parallelism is too low to hide the ~hundreds-of-cycles global load latency, even at 95% occupancy.
+
+**Method lesson (this cost two wrong calls — Entry 3 bank-conflicts, and re-diagnosis #1):** when no resource is saturated, **pull the stall-reason breakdown before naming a bottleneck.** Do not infer causation from a metric merely being nonzero/large (42.6 M bank conflicts looked damning but was ~8% noise).
+
+Corrected implication: the ~160 µs read roofline may actually be **reachable** — DRAM sits at 19% because we're latency-bound, not because counting is intrinsically expensive. Hiding the load latency should let DRAM throughput climb.
+
+Next step (v5): raise memory-level parallelism to hide the load — **vectorized loads** (each thread reads `uchar4`/`int` = 4 channels) and/or **unroll the row loop** (several independent loads in flight before the dependent atomics). Validate by checking `long_scoreboard` drops and DRAM throughput rises. (This diagnosis stays unconfirmed until v5 moves the needle — applying the lesson, not trusting it on faith.)
+
+---
+
