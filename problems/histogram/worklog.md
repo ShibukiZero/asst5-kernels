@@ -73,3 +73,41 @@ Next step:
 
 ---
 
+### Entry 1 — Physical transpose (PyTorch), to test the access-pattern hypothesis
+
+Date: 2026-06-24
+
+Thinking: if strided column reads are the problem, physically transposing `[length, channels] → [channels, length]` makes each channel contiguous; then per-channel bincount should read contiguous data. Predicted ~1.5 GB traffic (~3× ideal), much faster than baseline.
+
+Code version:
+- `submission.py`: `arr_t = array.t().contiguous()` (materialize transpose), then per-channel `bincount` on `arr_t[c]`.
+
+Command: `./run.sh histogram benchmark` / `profile`
+
+Correctness: **pass**
+
+Performance:
+- **Runtime: 45.36 ms** (mean of 20) vs baseline 51.31 ms → only **1.13×** faster. (Prediction missed — see below.)
+
+Profiler stats (representative kernels):
+
+| Kernel | DRAM read | L2 hit | DRAM thru | Note |
+|--------|-----------|--------|-----------|------|
+| `t().contiguous()` (1 big copy) | **34.35 GB** | 3.2% | 59.9% | the over-fetch **moved here** |
+| `kernelHistogram1D` (per channel) | **1.06 MB** | 72% | — | now contiguous ✓ (was 67 MB) |
+| `reduce` max + fills (per channel) | ~1.1 MB | 65% | — | still present, ×512 |
+
+Time decomposition: transpose ≈ 34.35 GB / (3.35 TB/s × 60%) ≈ **17 ms**; remaining ≈ **28 ms** is the 512-iteration loop overhead (launches + max-reduce + fills), ~55 µs/channel even though bincount is now cheap.
+
+Observation — prediction vs reality:
+- ✅ Correct: transposing makes the per-channel bincount read contiguous (67 MB → 1.06 MB, L2 hit 3%→72%).
+- ❌ Wrong: I assumed `.contiguous()` is a coalesced transpose (~0.5 GB). It is **not** — PyTorch does a naive element-wise copy whose **read side is still strided** → **34.35 GB read (~68× over-fetch)**. The over-fetch didn't vanish, it **relocated** into the copy.
+- ❌ Wrong: predicted ~1.5 GB total / ~3× ideal. Actual ≈ 35 GB, ~1.13× faster.
+
+Conclusion / lesson:
+1. A physical transpose via generic `.contiguous()` just moves the same 64–68× strided over-fetch into the copy kernel — no net win unless you hand-write a shared-memory coalesced transpose (and even then you pay an extra full copy).
+2. The 512-iteration Python loop is itself ~28 ms of fixed overhead, independent of access pattern.
+3. → Both point at the **fused single kernel**: read the original array once, row-major/coalesced, and `atomicAdd` into per-channel bins — never materialize a transpose (saves 34 GB) and no per-channel loop (saves 28 ms).
+
+---
+
