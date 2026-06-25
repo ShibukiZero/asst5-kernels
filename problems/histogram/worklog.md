@@ -272,3 +272,47 @@ Next step (v5b): vectorized loads — each thread reads `uchar4`/`int` (4 channe
 
 ---
 
+### Entry 6 — Vectorized int loads (4 ch/thread) + unroll — SLOWER (failed)
+
+Date: 2026-06-24
+
+Thinking: each thread reads one 32-bit word = 4 consecutive channels (4× fewer load instructions, more bytes/request), kept the ×8 unroll. Expected DRAM to climb past 39%.
+
+Code version (`submission.cu`): `CHX=CH/4=8` threads in x, each reads `int` via `reinterpret_cast<const uint32_t*>(data)`, unpacks 4 bytes → 4 atomics. block `(8,16)`=128 threads, grid `(16,256)`.
+
+Correctness: **pass**
+
+Performance:
+- **Runtime: 0.400 ms** — **slower** than v5a (0.359 ms) by ~11%.
+
+Profiler stats vs v5a:
+
+| Metric | v5a | v6 (vectorized) | |
+|--------|-----|-----------------|--|
+| **Achieved occupancy** | 92.7% | **35.5%** | ← crashed |
+| DRAM throughput | 39% | 37% | similar |
+| issue_active | 64.7% | 43.8% | down |
+| long_scoreboard | 6.01 | 4.72 | vectorize+unroll hid the load *better* |
+| short_scoreboard | 0.95 | 2.65 | shared mem up |
+
+Observation:
+- Vectorization did its job on the load (long_scoreboard 6→4.7), **but it forced a block-shape change** (4 channels/thread ⇒ only 8 threads in x ⇒ 128-thread blocks); with 32 KB shared that **crashed occupancy 92.7%→35.5%**, and the lost warps outweighed the instruction savings → net slower.
+- Lesson: an optimization that improves one metric can regress a more important one. Vectorization here is only worth it if occupancy is preserved — e.g. CH=128 with `int` loads keeps 32 threads/x (512-thread blocks) but needs 128 KB **dynamic** shared (opt-in via `cudaFuncSetAttribute`). Not pursued now (budget).
+
+Decision: **keep v5a (0.359 ms, 143×) as the best version.** Reverted `submission.cu` to v5a.
+
+---
+
+## Summary
+
+| Version | Runtime | vs baseline | Bottleneck addressed |
+|---------|---------|-------------|----------------------|
+| Entry 0 baseline (PyTorch) | 51.31 ms | 1× | — |
+| Entry 1 transpose (PyTorch) | 45.36 ms | 1.13× | (failed: over-fetch relocated) |
+| Entry 2 fused, global atomics | 6.77 ms | 7.6× | strided over-fetch → read once |
+| Entry 3 shared-mem privatized | 0.816 ms | 63× | global-atomic L2 traffic |
+| Entry 4 bank-conflict padding | 0.813 ms | 63× | (failed: no effect) |
+| **Entry 5 row-unroll ×8** | **0.359 ms** | **143×** | global-load latency (MLP) |
+| Entry 6 vectorized int loads | 0.400 ms | 128× | (failed: occupancy crash) |
+
+Best: **v5a (Entry 5), 0.359 ms, 143× over baseline, ~2.2× off the 160 µs read roofline.** Bottleneck is now a balance of residual load latency + emerging shared-atomic/shared-memory pressure; further gains would need vectorization *with* preserved occupancy (dynamic 128 KB shared) or sub-histogram replication.
