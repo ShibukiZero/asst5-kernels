@@ -241,3 +241,34 @@ Next step (v5): raise memory-level parallelism to hide the load — **vectorized
 
 ---
 
+### Entry 5 — Row-loop unroll (×8) on the v3 base; padding reverted
+
+Date: 2026-06-24
+
+Thinking: Entry 4 diagnosed latency-bound on the global load. v4's padding was a no-op, so reverted it (back to the clean v3 layout, `s[lc*num_bins+v]`) and instead raised memory-level parallelism: unroll the grid-stride row loop by UNROLL=8 so each thread issues 8 *independent* loads (into registers) before the 8 dependent atomics → 8 loads in flight to hide the ~hundreds-of-cycles load latency.
+
+Code version (`submission.cu`): v3 + `#define UNROLL 8`; unrolled body loads `v[8]` then does 8 `atomicAdd`. Same mapping/grid as v3. Read-once bijection unchanged (loads just regrouped).
+
+Correctness: **pass**
+
+Performance:
+- **Runtime: 0.359 ms** (mean of 3) → **143× over baseline**, **2.3× over v3** (0.816 ms). Now ~2.2× off the ~160 µs roofline.
+
+Validation (re-measured stall reasons — diagnosis confirmed, not assumed):
+
+| Metric | v4 | v5a | |
+|--------|----|----|--|
+| long_scoreboard (global-load wait) | 38.0 | **6.01** | ↓6× — latency now largely hidden ✓ |
+| DRAM throughput | 19% | **39%** | ↑2× — feeding faster ✓ |
+| issue_active | 34.6% | **64.7%** | warps issue ~2× more ✓ |
+| mio_throttle (shared atomics) | 0.01 | 1.94 | shared atomics now emerging |
+| short_scoreboard | 0.13 | 0.95 | shared memory emerging |
+
+Observation:
+- The latency-bound diagnosis is **confirmed by experiment**: adding MLP dropped `long_scoreboard` 38→6 and doubled DRAM throughput. This is the validation that Entry 3/4's guesses lacked.
+- New state is more balanced: `long_scoreboard` (6.0) still the top stall but much smaller; shared-atomic (`mio_throttle` 1.94) and shared-memory (`short_scoreboard` 0.95) now visible. DRAM at 39% ⇒ ~2.5× headroom to bandwidth saturation.
+
+Next step (v5b): vectorized loads — each thread reads `uchar4`/`int` (4 channels) per load → 4× fewer load instructions and more bytes/request, pushing DRAM higher. Also consider larger UNROLL. Watch whether shared atomics (`mio_throttle`) become the next wall.
+
+---
+
