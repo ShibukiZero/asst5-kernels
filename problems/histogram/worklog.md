@@ -303,6 +303,41 @@ Decision: **keep v5a (0.359 ms, 143×) as the best version.** Reverted `submissi
 
 ---
 
+### Entry 7 — Grid/block sweep (launch-config tuning) — FINAL
+
+Date: 2026-06-25
+
+Thinking: at v5a, occupancy was already ~93%, so the launch params (CH=32, blockDim.y=16, gridDim.y=128, UNROLL=8) were untuned guesses. Swept them to find the sweet spot. Made `blockDim.y`/`gridDim.y` env-configurable (one compile, sweep via env); CH via recompile.
+
+Sweep (best per channel-tile size, benchmark mean):
+
+| CH | best (BY, GY) | best time |
+|----|---------------|-----------|
+| 16 | (32, 32) | 0.391 ms (worse) |
+| **32** | **(32, 32)** | **0.343 ms** ✅ |
+| 64 (dynamic shmem) | (16, 32) | 0.349 ms |
+
+- **Best: CH=32, blockDim.y=32, gridDim.y=32 → 0.343 ms** (vs untuned v5a 0.359 ms, ~4%).
+- Pattern: **more row-lanes + fewer blocks** wins (fewer blocks ⇒ fewer global flush atomics, parallelism still sufficient). CH=32 is the sweet spot — 16 is worse (more blocks, 16-wide coalescing), 64 not better.
+- As predicted, grid tuning is a single-digit-% gain (occupancy was already saturated), not a step change.
+
+Profiler at the best point (`hist_kernel`):
+
+| Metric | Value | |
+|--------|-------|--|
+| **L1TEX throughput** | **91.6%** | ← near-saturated: the **new bottleneck** |
+| SM / L2 throughput | 64.7% / 57.7% | |
+| **DRAM throughput** | **40.7%** | not bandwidth-bound |
+| Achieved occupancy | 90.4% | |
+| stall long_scoreboard | 6.95 | residual load latency |
+| stall mio_throttle | 2.56 | shared-atomic pipe |
+
+Observation — bottleneck has migrated to the **L1TEX / shared-memory pipe (91.6%)**: the 537 M shared `atomicAdd`s + global loads now saturate that pipe. This is the *first* time a real resource is saturated (v3/v4 were latency-bound with nothing saturated). DRAM at 40.7% ⇒ ~60% bandwidth is unusable because the shared-atomic counting work gates it. The L1TEX cost was always there (inherent to "one atomic per element"); earlier bottlenecks (L2, load latency) masked it until we cleared them.
+
+Conclusion — **STOP here.** Higher occupancy / more grid tuning won't help: the limiter is a saturated pipe doing the algorithm's intrinsic work, not lack of warps. Beating it needs *fewer* shared atomics (warp-aggregation — ineffective here since a warp spans 32 distinct channels, or a sort/reduce-based count) — an algorithmic change with low ROI.
+
+---
+
 ## Summary
 
 | Version | Runtime | vs baseline | Bottleneck addressed |
@@ -312,7 +347,12 @@ Decision: **keep v5a (0.359 ms, 143×) as the best version.** Reverted `submissi
 | Entry 2 fused, global atomics | 6.77 ms | 7.6× | strided over-fetch → read once |
 | Entry 3 shared-mem privatized | 0.816 ms | 63× | global-atomic L2 traffic |
 | Entry 4 bank-conflict padding | 0.813 ms | 63× | (failed: no effect) |
-| **Entry 5 row-unroll ×8** | **0.359 ms** | **143×** | global-load latency (MLP) |
+| Entry 5 row-unroll ×8 | 0.359 ms | 143× | global-load latency (MLP) |
 | Entry 6 vectorized int loads | 0.400 ms | 128× | (failed: occupancy crash) |
+| **Entry 7 grid/block tuning** | **0.343 ms** | **~150×** | flush-atomic count (launch config) |
 
-Best: **v5a (Entry 5), 0.359 ms, 143× over baseline, ~2.2× off the 160 µs read roofline.** Bottleneck is now a balance of residual load latency + emerging shared-atomic/shared-memory pressure; further gains would need vectorization *with* preserved occupancy (dynamic 128 KB shared) or sub-histogram replication.
+**Final: 0.343 ms, ~150× over baseline, ~2.1× off the 160 µs read roofline** (code: `versions/v7_grid_tuned.cu`).
+
+Why stop: the kernel is now **L1TEX/shared-memory-pipe bound** (91.6%) on the 537 M shared atomics — the intrinsic cost of counting. DRAM is only ~41%, so it's no longer memory-bound; the read roofline is unreachable because counting, not reading, now dominates. Remaining gains need an algorithmic change (fewer atomics), which is low-ROI.
+
+Key lessons recorded along the way: (1) strided column access over-fetches ~64×; read once, coalesced. (2) a physical transpose just relocates the over-fetch. (3) when nothing is saturated, read **warp stall reasons** before naming a bottleneck — guessing cost two wrong calls (bank conflicts, "shared-atomic throughput"). (4) padding only fixes bank conflicts for correlated writes, not random data. (5) occupancy is a means (latency hiding) with diminishing returns — 90%+ occupancy didn't prevent being latency-bound; ILP (unroll) fixed it. (6) optimization migrates the bottleneck until you hit an intrinsic resource limit.

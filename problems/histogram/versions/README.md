@@ -10,8 +10,9 @@ tracked. These files preserve the code for each step described in `../worklog.md
 | `v2_fused_global_atomics.cu` | 2 | 6.77 ms | read once, global atomics |
 | `v3_shared_privatized.cu` | 3 | 0.816 ms | shared-mem sub-histograms |
 | `v4_bankconflict_padding.cu` | 4 | 0.813 ms | ❌ padding: no effect |
-| **`v5a_row_unroll.cu`** | 5 | **0.359 ms** | ✅ BEST — unroll hides load latency |
+| `v5a_row_unroll.cu` | 5 | 0.359 ms | unroll hides load latency |
 | `v6_vectorized_int.cu` | 6 | 0.400 ms | ❌ vectorize: occupancy crash |
+| **`v7_grid_tuned.cu`** | 7 | **0.343 ms** | ✅ BEST — tuned launch (CH=32, by=32, gy=32) |
 
 To run a version: copy it to `../submission.cu` (or `../submission.py` for v1),
 then `python ../wrap_cuda_submission.py local` and `./run.sh histogram <mode>`.
