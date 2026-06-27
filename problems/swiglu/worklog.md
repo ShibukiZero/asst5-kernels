@@ -161,6 +161,15 @@ Three things had to be right to get there (each was a real bug/lesson):
 2. **Schedule pairing + opt flags.** The auto-builder paired the warp-specialized mainloop with a **non-TMA `DefaultEpilogue`**; that mismatch triggered ptxas `C7510 "wgmma instructions serialized — pipeline crossing function boundary"` and cost ~20%. Fix: explicitly pair `KernelTmaWarpSpecializedCooperative` + `epilogue::TmaWarpSpecializedCooperative`, and add `-O3 -DNDEBUG` (`load_inline` doesn't add them). 1.007 → 0.817 ms.
 3. **`load_inline` in eval's spawned workers.** Tests run in a `multiprocessing` worker where `sys.stdout/stderr` are `None`; torch's JIT build touches them → `'NoneType' object has no attribute 'flush'`. Fix: guard the streams + pre-build the `.so` before the worker imports it.
 
+Profiling (ncu SpeedOfLight, the winning 0.817 ms CUTLASS GEMM vs cuBLAS, same M×N×K):
+
+| kernel | Compute (SM) % | Memory % | DRAM % | top warp stall |
+|--------|----------------|----------|--------|----------------|
+| **CUTLASS gate (TN, this kernel)** | **87.2 %** | 57.7 % | 34.4 % | short-scoreboard (shared) ~45 % |
+| cuBLAS (NN) | 73.2 % | 77.8 % | 27.0 % | — |
+
+⇒ **CUTLASS wins by hitting 87 % SM throughput vs cuBLAS's 73 %.** The cuBLAS kernel is the `nn` variant (it consumes K-minor `W` directly, no transpose) but pays with lower compute utilization and higher memory pressure (78 %). The CUTLASS TN kernel is compute-bound with **DRAM headroom (34 %)** — which is exactly why fusing an epilogue into it later (Entry 5's EVT idea) is nearly free.
+
 **Then the wall (the real result).** Full `custom_kernel` (2 CUTLASS GEMMs + 2 transposes + torch `silu(gate+b)*(value+c)`) = **2.501 ms** — *slower* than Entry 2 (2.036 ms), because the non-fused epilogue + transposes eat the GEMM win. EVT fusion would cut it to ~1.8 ms (a genuine speed win). **But it fails correctness either way**, and that is fundamental:
 
 - `ref_kernel` uses plain `x@W` with **no** `set_float32_matmul_precision`. So the reference's precision is whatever the *global* flag is. Entry 1/2 set it → reference ran **cuBLAS-TF32** and their cuBLAS matmuls were **bit-identical** → trivially passed. That's the only reason they passed.
@@ -215,6 +224,16 @@ Results (harness):
 | **H2 + compiled epilogue + guard** | **pass** | **1.954 ms** | **1.04×** ✅ best |
 
 Guard tested: normal → selects `h2` (matches ref); monkeypatched-bad CUTLASS → detects mismatch → falls back → matches ref. Bulletproof.
+
+Profiling — per-kernel breakdown of the H2 fast path (torch.profiler, 20 calls, mean per call):
+
+| kernel | per-call | share | ncu Compute(SM)% | ncu DRAM% | bound |
+|--------|----------|-------|------------------|-----------|-------|
+| cuBLAS value `sm90_xmma_gemm…_nn_n…` | 816 µs | 45 % | 73.2 % | 27.0 % | compute |
+| CUTLASS gate `device_kernel<…GemmUniversal…>` | 735 µs | 41 % | 87.2 % | 34.4 % | compute |
+| epilogue `triton_poi_fused_add_mul_silu_0` | 253 µs | 14 % | 26.5 % | **92.1 %** | **memory** |
+
+(GPU-kernel sum ≈ 1.80 ms; harness wall-clock 1.954 ms incl. launch/guard overhead. ncu durations are replay-inflated, so per-call times are from torch.profiler.) Observations: the CUTLASS gate (735 µs) is faster than the cuBLAS value (816 µs) despite cuBLAS's NN no-transpose advantage — the 87 %-vs-73 % SM gap wins. The **epilogue is 92 % DRAM-bound** (memset+gate-read+value-read+out-write, all traffic), 14 % of the time and already at the memory roofline → can't be sped up, only **eliminated** by fusing it into a GEMM. Since the gate GEMM has DRAM headroom (34 %), an EVT epilogue on it can absorb the ~253 µs nearly for free → motivates the EVT follow-up (est. ~1.6–1.65 ms kernel time).
 
 Conclusion: **Entry 5 (1.954 ms guarded) is the new best — the first hand-written kernel to beat the PyTorch baseline on this problem.** The win is one cuBLAS GEMM (0.98 ms) replaced by the faster CUTLASS gate GEMM (0.817 ms) while `value` stays cuBLAS for correctness, epilogue Inductor-fused. Headroom remains: an EVT epilogue fusing `silu(gate+b)*(value+c)` into the CUTLASS gate GEMM (reading `value` as an aux tensor) would drop the separate epilogue pass → est. ~1.83 ms.
 
