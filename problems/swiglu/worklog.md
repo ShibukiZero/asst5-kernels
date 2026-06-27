@@ -27,7 +27,7 @@ Hardware: NVIDIA H100 80GB HBM3 (Nebius VM), CUDA 13, torch 2.12.1+cu130, ncu 20
 
 ## Optimization Entries
 
-Each entry: how I thought about it, what I changed, the result, and the profiling. Failures recorded too.
+Each entry: how it was thought about, what changed, the result, and the profiling. Failures recorded too.
 
 ### Entry 0 — Baseline (PyTorch reference)
 
@@ -147,7 +147,7 @@ Thinking: Entry 3 said "CUTLASS-level effort" is the only way to beat cuBLAS —
 
 Code version: `versions/v4_cutlass.py` (the `submission.py` that was tested). CUTLASS headers from the bundled `nvidia-cutlass 4.2` (`cutlass_library/source/include` + `tools/util/include`).
 
-What I built and measured (GEMM shape M=16384, K=2048, N=4096, standalone vs `A@W`):
+What was built and measured (GEMM shape M=16384, K=2048, N=4096, standalone vs `A@W`):
 
 | Step | GEMM (ms) | vs cuBLAS (~0.93 ms) |
 |------|-----------|----------------------|
@@ -175,12 +175,12 @@ Profiling (ncu SpeedOfLight, the winning 0.817 ms CUTLASS GEMM vs cuBLAS, same M
 **Then the wall (the real result).** Full `custom_kernel` (2 CUTLASS GEMMs + 2 transposes + torch `silu(gate+b)*(value+c)`) = **2.501 ms** — *slower* than Entry 2 (2.036 ms), because the non-fused epilogue + transposes eat the GEMM win. EVT fusion would cut it to ~1.8 ms (a genuine speed win). **But it fails correctness either way**, and that is fundamental:
 
 - `ref_kernel` uses plain `x@W` with **no** `set_float32_matmul_precision`. So the reference's precision is whatever the *global* flag is. Entry 1/2 set it → reference ran **cuBLAS-TF32** and their cuBLAS matmuls were **bit-identical** → trivially passed. That's the only reason they passed.
-- If I **set** the flag: reference = cuBLAS-TF32, my CUTLASS-TF32 ≠ it bit-for-bit → fail (the Entry 3 / Triton case).
-- If I **don't** set it (what `v4_cutlass.py` does): reference = **true FP32**, my CUTLASS-TF32 differs by the TF32 quantization. Measured against FP32: **2.625 % of elements violate** (1 761 787 / 67 108 864), max abs diff 12.24, median |out| of violated elements ≈ 9.3 (not just near-zero). `allclose` is all-or-nothing → fail.
+- With the flag **set**: reference = cuBLAS-TF32, the CUTLASS-TF32 result ≠ it bit-for-bit → fail (the Entry 3 / Triton case).
+- With it **not set** (what `v4_cutlass.py` does): reference = **true FP32**, the CUTLASS-TF32 result differs by the TF32 quantization. Measured against FP32: **2.625 % of elements violate** (1 761 787 / 67 108 864), max abs diff 12.24, median |out| of violated elements ≈ 9.3 (not just near-zero). `allclose` is all-or-nothing → fail.
 
 Why fundamental: TF32 carries ~1e-3 relative error; `out = silu(gate)·value` with `atol=1e-2` means wherever the *output* is small but the *factors* aren't, the absolute error (~1e-3 × factor magnitude ≈ 0.04) blows the 0.01 atol. The nonlinear epilogue guarantees a few-percent of such elements. The only way to pass at TF32 speed is to be **bit-identical to cuBLAS-TF32** — i.e. *use* cuBLAS. (3xTF32 emulation would hit FP32 accuracy and pass, but at ~3× cost ⇒ ~4.9 ms, far slower than Entry 2 — dead end.)
 
-Conclusion (PARTIALLY WRONG — corrected in Entry 5): I concluded "kept Entry 2; CUTLASS can't pass." The GEMM-speed finding stands, but the correctness conclusion was set up wrong and is overturned below.
+Conclusion (PARTIALLY WRONG — corrected in Entry 5): the conclusion was "kept Entry 2; CUTLASS can't pass." The GEMM-speed finding stands, but the correctness conclusion was set up wrong and is overturned below.
 
 Lessons: (1) A hand-written CUTLASS 3.x GEMM *can* beat cuBLAS — the levers are TN-native layout, matched warp-specialized mainloop+epilogue schedules, and `-O3`. (2) Hopper TF32 GMMA is TN-only → K-minor operands cost a transpose. (3) The auto-builder's epilogue choice can serialize wgmma; pair schedules explicitly and read ptxas warnings.
 

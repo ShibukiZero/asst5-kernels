@@ -67,7 +67,7 @@ Next step (Entry 1): `torch.compile` the reference; measure the fusion win and c
 
 Date: 2026-06-27
 
-Thinking: the baseline's ~219 tiny kernels/step are pure launch+bandwidth waste. `torch.compile` should fuse the slice/add/mul chain into a few Triton kernels. The reference's in-place `copy_`/slice-assign/swap + `DeterministicContext` graph-break, so I rewrote a **functional per-step** version with math identical to the reference and compiled that.
+Thinking: the baseline's ~219 tiny kernels/step are pure launch+bandwidth waste. `torch.compile` should fuse the slice/add/mul chain into a few Triton kernels. The reference's in-place `copy_`/slice-assign/swap + `DeterministicContext` graph-break, so a **functional per-step** version with math identical to the reference was written and compiled.
 
 Code version: `versions/v1_compile.py` (= `submission.py`).
 
@@ -87,7 +87,7 @@ Profiling (torch.profiler, n_steps=2):
 Observation:
 - **Inductor fused ~219 → ~5 kernels/step → 6.6×.** Big, cheap win.
 - **ncu shows the dominant Inductor kernel is occupancy-limited (23 %), not bandwidth-bound** (DRAM 14 %, L2 41 %, SM 49 %) — it under-utilizes everything. This is *why* torch.compile (213 ms) later loses to the hand Triton/CUDA (~85 ms), which reach 80 % occupancy / 90 % L2.
-- **But it's still far from the ~21 ms roofline (we're at 218 ms).** The dominant fused kernel is **6.79 ms ≈ 22 GB of HBM traffic ≈ 25 field-reads** — i.e. the fused stencil computes all 25 taps in one kernel but reads each shifted slice **from global memory separately (no neighbor reuse)**. Inductor generates a pointwise kernel; it does not stage a tile+halo in shared memory. Plus it still materializes the per-stage `k`/`u_stage` intermediates.
+- **But it's still far from the ~21 ms roofline (218 ms here).** The dominant fused kernel is **6.79 ms ≈ 22 GB of HBM traffic ≈ 25 field-reads** — i.e. the fused stencil computes all 25 taps in one kernel but reads each shifted slice **from global memory separately (no neighbor reuse)**. Inductor generates a pointwise kernel; it does not stage a tile+halo in shared memory. Plus it still materializes the per-stage `k`/`u_stage` intermediates.
 
 Hypothesis / next (Entry 2): hand-written **CUDA/Triton stencil with shared-memory halo reuse** — load each field tile + 4-cell halo **once** into shared memory, compute all 25 taps from SRAM (≈ 1 field-read instead of ~25), and fuse the RK4 stages to avoid materializing k1..k4. Should cut the dominant kernel ~10–25× toward the roofline. Correctness: must hold 1e-6 — replicate the reference's op order and test `-fmad=false` vs default early (Inductor passed, but a hand CUDA kernel with default FMA might not).
 
@@ -144,7 +144,7 @@ Code version: `versions/v3_cuda_naive.py`. Scalars `ihx/S/dt` computed in **fp32
 
 **Correctness gate — the key result:** passes 1e-6 with **both** `--fmad=true` and `--fmad=false` (max abs diff **4.77e-7 = ~1 fp32 ulp, identical for both**). So the FMA-contraction worry was **unfounded** for this problem — a straightforward CUDA fp32 implementation matches the reference within tolerance regardless of fmad. (Good to know; no need to fight the compiler.)
 
-Performance: **85.5 ms** (my timing) — **ties the Triton Entry 2 (88 ms)** and beats the README's naive CUDA (148 ms), because we fuse the 4 stages' combines + boundary-copy into the kernels (their "naive" likely doesn't).
+Performance: **85.5 ms** (local timing) — **ties the Triton Entry 2 (88 ms)** and beats the README's naive CUDA (148 ms), because the 4 stages' combines + boundary-copy are fused into the kernels (their "naive" likely doesn't).
 
 Profiling (ncu, `stage_k`, large):
 
@@ -157,7 +157,7 @@ Profiling (ncu, `stage_k`, large):
 | Achieved Occupancy | 80.2 % |
 | Duration | 2.13 ms |
 
-Observation: naive CUDA ≈ Triton (~85–88 ms), and ncu shows it is **L2-bandwidth-bound (90.4 % L2 throughput)**, *not* DRAM-bound (50 %) or compute-bound (66 %), at a healthy 80 % occupancy. **The 25 neighbor reads are served by L2 at ~90 % saturation — L2 is doing the stencil reuse.** (My earlier "~47 % DRAM" guess was wrong; the real picture is L2-limited.) This both explains why naive is fast *and* foreshadows Entry 4: since L2 already provides near-saturated reuse, manually moving reuse to shared memory can't help (and adds halo + barrier overhead). **No win over Entry 2 yet** (kept Triton/naive as best). To go faster one must cut L2 traffic (e.g. vectorized/coalesced loads), not add manual tiling.
+Observation: naive CUDA ≈ Triton (~85–88 ms), and ncu shows it is **L2-bandwidth-bound (90.4 % L2 throughput)**, *not* DRAM-bound (50 %) or compute-bound (66 %), at a healthy 80 % occupancy. **The 25 neighbor reads are served by L2 at ~90 % saturation — L2 is doing the stencil reuse.** (The earlier "~47 % DRAM" guess was wrong; the real picture is L2-limited.) This both explains why naive is fast *and* foreshadows Entry 4: since L2 already provides near-saturated reuse, manually moving reuse to shared memory can't help (and adds halo + barrier overhead). **No win over Entry 2 yet** (kept Triton/naive as best). To go faster one must cut L2 traffic (e.g. vectorized/coalesced loads), not add manual tiling.
 
 Next (Entry 4): **2.5D blocking** — shared-memory (x,y) tile + register queue marching in z, so each plane is read once. Target: cut `_stage` toward ~1 ms / total toward the ~21 ms roofline.
 

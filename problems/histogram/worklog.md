@@ -25,7 +25,7 @@ Hardware: NVIDIA H100 80GB HBM3 (Nebius VM), CUDA 13, torch 2.12.1+cu130, ncu 20
 
 ## Optimization Entries
 
-Each entry: how I thought about it, what I changed, the result, and the profiling. Failures recorded too.
+Each entry: how it was thought about, what changed, the result, and the profiling. Failures recorded too.
 
 ### Entry 0 — Baseline (PyTorch reference)
 
@@ -66,7 +66,7 @@ Observation — what limits performance:
 4. Even the big kernels only hit ~55% DRAM throughput — strided access can't saturate HBM.
 
 Hypothesis:
-- The kernel is memory-bound and we are wasting >100× bandwidth purely on the **access pattern** (strided column reads) and reading the array many times instead of once. A single fused kernel that reads the array **once, coalesced** (consecutive threads → consecutive channels within a row) should collapse the runtime toward the ~160 µs roofline.
+- The kernel is memory-bound and >100× bandwidth is wasted purely on the **access pattern** (strided column reads) and reading the array many times instead of once. A single fused kernel that reads the array **once, coalesced** (consecutive threads → consecutive channels within a row) should collapse the runtime toward the ~160 µs roofline.
 
 Next step:
 - Replace the Python loop with **one fused kernel** that streams the array once with coalesced reads, then attack atomic contention.
@@ -101,7 +101,7 @@ Time decomposition: transpose ≈ 34.35 GB / (3.35 TB/s × 60%) ≈ **17 ms**; r
 
 Observation — prediction vs reality:
 - ✅ Correct: transposing makes the per-channel bincount read contiguous (67 MB → 1.06 MB, L2 hit 3%→72%).
-- ❌ Wrong: I assumed `.contiguous()` is a coalesced transpose (~0.5 GB). It is **not** — PyTorch does a naive element-wise copy whose **read side is still strided** → **34.35 GB read (~68× over-fetch)**. The over-fetch didn't vanish, it **relocated** into the copy.
+- ❌ Wrong: `.contiguous()` was assumed to be a coalesced transpose (~0.5 GB). It is **not** — PyTorch does a naive element-wise copy whose **read side is still strided** → **34.35 GB read (~68× over-fetch)**. The over-fetch didn't vanish, it **relocated** into the copy.
 - ❌ Wrong: predicted ~1.5 GB total / ~3× ideal. Actual ≈ 35 GB, ~1.13× faster.
 
 Conclusion / lesson:
@@ -115,7 +115,7 @@ Conclusion / lesson:
 
 Date: 2026-06-27
 
-Thinking: Entry 1 left us at a clear decision point — strided over-fetch is the
+Thinking: Entry 1 left a clear decision point — strided over-fetch is the
 root cause, a physical transpose just relocates it, so the answer is a **fused
 single-pass kernel that reads once, coalesced**. Before hand-writing CUDA, what
 is the *best a competent Triton author* can do here? Triton is the obvious reach
@@ -204,7 +204,7 @@ C counts efficiently but pays strided reads. Triton excels at fused
 elementwise/matmul shapes; histogram's privatized-scatter pattern is precisely
 where giving up shared-memory control costs you the key optimization.
 
-Next step: to break past 4 ms we must hand-manage shared memory — i.e. drop to
+Next step: to break past 4 ms shared memory must be hand-managed — i.e. drop to
 CUDA. Entry 3 is the same idea as Variant A (fused, coalesced, global atomics)
 but in CUDA, which then unlocks the shared-mem privatization Triton can't express.
 
@@ -284,7 +284,7 @@ Observation:
 - But no resource is saturated (all 19–43%) **despite 95% occupancy** ⇒ warps are resident but **stalled**, not starved. The cause is **shared-memory bank conflicts** (42.6 M): `s[lc*256 + v]` has bank = `(lc*256+v) mod 32` = `v mod 32` — independent of `lc`, so a warp's 32 threads (varied values) collide heavily, serializing the shared atomics.
 
 Hypothesis / next step (v4):
-- Pad the per-channel stride 256 → 257: `s[lc*257 + v]` ⇒ bank = `(lc+v) mod 32` (257 mod 32 = 1). A warp's lc = 0..31 then spreads across all 32 banks regardless of value → conflict-free. Shared cost 32 KB → 32.1 KB (negligible). Re-measure bank conflicts and whether we become DRAM-bound.
+- Pad the per-channel stride 256 → 257: `s[lc*257 + v]` ⇒ bank = `(lc+v) mod 32` (257 mod 32 = 1). A warp's lc = 0..31 then spreads across all 32 banks regardless of value → conflict-free. Shared cost 32 KB → 32.1 KB (negligible). Re-measure bank conflicts and whether the kernel becomes DRAM-bound.
 - If same-address atomic contention (row-lanes hitting the same `(lc,v)`) shows up next, consider replicated sub-histograms.
 
 > ⚠️ **Correction (after Entry 5):** the "bank conflicts are the bottleneck" attribution above was **wrong** — inferred from a nonzero metric without measuring warp stall reasons. Padding (Entry 5) disproved it; the real bottleneck is global-load latency. Kept here to show the (mistaken) reasoning at the time.
@@ -314,10 +314,10 @@ Profiler stats:
 | Duration | 856 µs | 852 µs |
 
 Why it failed (the lesson):
-- My padding reasoning assumed all threads in a warp write the **same** value v (then bank = `(lc+v)%32` is a perfect permutation). But the data is **uniform-random**: each lane's `v_lc` is independent → bank = `(lc+v_lc)%32` is still random → **same conflict rate**. **Padding only removes bank conflicts for correlated/identical writes; for random values it does nothing.**
+- The padding reasoning assumed all threads in a warp write the **same** value v (then bank = `(lc+v)%32` is a perfect permutation). But the data is **uniform-random**: each lane's `v_lc` is independent → bank = `(lc+v_lc)%32` is still random → **same conflict rate**. **Padding only removes bank conflicts for correlated/identical writes; for random values it does nothing.**
 - More importantly, padding moving the runtime by ~0 shows **bank conflicts were never the real bottleneck** (42.6 M conflicts is only ~8% of the 537 M shared atomics; the Entry-4 hypothesis was wrong).
 
-Re-diagnosis attempt #1 (ALSO WRONG): I then guessed "raw shared-atomic throughput" — again from indirect signals, without measuring. Disproven below.
+Re-diagnosis attempt #1 (ALSO WRONG): "raw shared-atomic throughput" was then guessed — again from indirect signals, without measuring. Disproven below.
 
 Re-diagnosis #2 — measured warp stall reasons (the *direct* signal):
 
@@ -334,7 +334,7 @@ Re-diagnosis #2 — measured warp stall reasons (the *direct* signal):
 
 **Method lesson (this cost two wrong calls — Entry 4 bank-conflicts, and re-diagnosis #1):** when no resource is saturated, **pull the stall-reason breakdown before naming a bottleneck.** Do not infer causation from a metric merely being nonzero/large (42.6 M bank conflicts looked damning but was ~8% noise).
 
-Corrected implication: the ~160 µs read roofline may actually be **reachable** — DRAM sits at 19% because we're latency-bound, not because counting is intrinsically expensive. Hiding the load latency should let DRAM throughput climb.
+Corrected implication: the ~160 µs read roofline may actually be **reachable** — DRAM sits at 19% because the kernel is latency-bound, not because counting is intrinsically expensive. Hiding the load latency should let DRAM throughput climb.
 
 Next step (v5): raise memory-level parallelism to hide the load — **vectorized loads** (each thread reads `uchar4`/`int` = 4 channels) and/or **unroll the row loop** (several independent loads in flight before the dependent atomics). Validate by checking `long_scoreboard` drops and DRAM throughput rises. (This diagnosis stays unconfirmed until v5 moves the needle — applying the lesson, not trusting it on faith.)
 
@@ -431,7 +431,7 @@ Profiler at the best point (`hist_kernel`):
 | stall long_scoreboard | 6.95 | residual load latency |
 | stall mio_throttle | 2.56 | shared-atomic pipe |
 
-Observation — bottleneck has migrated to the **L1TEX / shared-memory pipe (91.6%)**: the 537 M shared `atomicAdd`s + global loads now saturate that pipe. This is the *first* time a real resource is saturated (v3/v4 were latency-bound with nothing saturated). DRAM at 40.7% ⇒ ~60% bandwidth is unusable because the shared-atomic counting work gates it. The L1TEX cost was always there (inherent to "one atomic per element"); earlier bottlenecks (L2, load latency) masked it until we cleared them.
+Observation — bottleneck has migrated to the **L1TEX / shared-memory pipe (91.6%)**: the 537 M shared `atomicAdd`s + global loads now saturate that pipe. This is the *first* time a real resource is saturated (v3/v4 were latency-bound with nothing saturated). DRAM at 40.7% ⇒ ~60% bandwidth is unusable because the shared-atomic counting work gates it. The L1TEX cost was always there (inherent to "one atomic per element"); earlier bottlenecks (L2, load latency) masked it until they were cleared.
 
 Conclusion — **STOP here.** Higher occupancy / more grid tuning won't help: the limiter is a saturated pipe doing the algorithm's intrinsic work, not lack of warps. Beating it needs *fewer* shared atomics (warp-aggregation — ineffective here since a warp spans 32 distinct channels, or a sort/reduce-based count) — an algorithmic change with low ROI.
 

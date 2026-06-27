@@ -65,7 +65,7 @@ Profiling — stage breakdown on the large case (CUDA events; matches harness fu
 Observation — what limits performance:
 - **The two GEMMs would be ~9 ms at peak; the baseline is 115 ms (~13×).** Almost none of it is real compute — both GEMMs run at ~2.5 TB/s (memory-bound, not compute-bound) because they write/read the 34 GB S×S matrix, and **softmax alone is 67 ms (58%)** streaming 69 GB at a poor 1.03 TB/s.
 - This is the textbook **O(N²) memory wall**: ~106 of the 115 ms is moving the S×S scores/probs through HBM, not computing.
-- Note (process): my first profiling pass was wrong — I called `generate_input(B,N,S,D)` positionally, but its signature is `(batch, heads, head_dim, seq_len, seed)` (head_dim before seq_len), so I accidentally profiled S=128/D=8192 and got an impossible 0.76 ms. The harness (keyword args) was right. Fixed by calling with keywords; numbers above are correct.
+- Note (process): the first profiling pass was wrong — `generate_input(B,N,S,D)` was called positionally, but its signature is `(batch, heads, head_dim, seq_len, seed)` (head_dim before seq_len), so it accidentally profiled S=128/D=8192 and got an impossible 0.76 ms. The harness (keyword args) was right. Fixed by calling with keywords; numbers above are correct.
 
 Hypothesis:
 - **FlashAttention**: tile Q/K/V, compute attention block-by-block in SRAM with **online softmax**, never materializing S×S. HBM traffic drops from ~34 GB×(several passes) to ~2.15 GB (Q/K/V/O) ⇒ becomes compute-bound, should approach the ~9 ms floor. PyTorch's `F.scaled_dot_product_attention` (cuDNN/flash) is the library reference (README: ~28 ms large, ~4.5×).
@@ -92,7 +92,7 @@ Performance (harness benchmark):
 | medium (2,64,4096,128) | 12.685 ms | 1.632 ms | 7.8× |
 | **large (4,64,8192,128)** | **115.04 ms** | **12.76 ms** | **9.0×** |
 
-Backend comparison (large, `torch.nn.attention.sdpa_kernel`, my-loop timing):
+Backend comparison (large, `torch.nn.attention.sdpa_kernel`, manual-loop timing):
 
 | backend | time | note |
 |---------|------|------|
@@ -104,7 +104,7 @@ Observation:
 - **SDPA (cuDNN) = 12.76 ms, 9× over baseline.** Achieves 8.8 TFLOP / 12.76 ms ≈ **690 TF/s (~70 % of FP16 peak)** — i.e. it's now **compute-bound and near the ~9 ms floor**, exactly as the roofline predicted once the S×S traffic is gone. Peak memory drops from 71 GB to a few GB (no S×S).
 - The default backend is **cuDNN**, which is ~2× faster than the bundled FA-2 "flash" backend (14 vs 24.6 ms) — on Hopper cuDNN is FA-3-class (wgmma + TMA + warp-specialization). The README's 28 ms was the FA-2 backend; cuDNN moved the bar much lower.
 
-Profiling (ncu): the cuDNN kernel is `cudnn_generated_fort_native_sdpa_sm90_flash_fprop_wgmma_f16_…` — **Compute(SM) 76.9 %, DRAM 4.4 %, L2 50 %**. Confirms it's an sm90 flash-attention wgmma kernel (FA-3 lineage), compute-bound, S×S traffic gone. Note: this **76.9 % SM matches our hand CUTLASS FA-3's 76.2 %** (Entry 4) — hardware-level parity, not just wall-clock.
+Profiling (ncu): the cuDNN kernel is `cudnn_generated_fort_native_sdpa_sm90_flash_fprop_wgmma_f16_…` — **Compute(SM) 76.9 %, DRAM 4.4 %, L2 50 %**. Confirms it's an sm90 flash-attention wgmma kernel (FA-3 lineage), compute-bound, S×S traffic gone. Note: this **76.9 % SM matches the hand CUTLASS FA-3's 76.2 %** (Entry 4) — hardware-level parity, not just wall-clock.
 
 Hypothesis / next: a hand-written Triton FlashAttention (online softmax + tiling) is the learning goal. **Bar to beat: cuDNN's ~12.76 ms** (≈70 % MFU) — a high bar (same lesson as swiglu: the library is near-peak). Realistic aim: learn the algorithm and get within ~1.5–2× of cuDNN; matching/beating it would need FA-3-level Hopper engineering (CUTLASS/CuTe). Correctness regime is friendly (FP16, tol 1e-2, FP32 online-softmax accumulators are *more* accurate than the reference), unlike swiglu's TF32 self-reference trap.
 
@@ -157,7 +157,7 @@ Profiling (ncu, best config, large; ncu duration replay-inflated to 21.4 ms vs r
 Observation:
 - **The flash-attention win is real and confirmed by ncu: DRAM is only 3 %** (vs the baseline which was memory-bound at ~2.5 TB/s streaming the 34 GB S×S). The O(N²) memory wall is gone; the kernel is now compute-bound. Peak memory ~few GB (no S×S).
 - **18.86 ms ≈ 467 TF/s ≈ 47 % MFU.** It beats the baseline 6.1× and **beats PyTorch's own FA-2 "flash" backend (24.6 ms)**, but loses to **cuDNN (12.76 ms, ~70 % MFU)** by 1.48×.
-- **Why the gap to cuDNN:** SM throughput is only 52 % and occupancy 12.5 %, **limited by registers** (the `[128,128]` FP32 accumulator + Q tile). cuDNN on Hopper is FA-3-class — **warp-specialized** (separate producer/consumer warpgroups), **TMA** async loads, and software-pipelined MMA/softmax — which keep the tensor cores fed at ~70 %. Our single-program Triton kernel can't express that scheduling, so it stalls at barriers and under-occupies.
+- **Why the gap to cuDNN:** SM throughput is only 52 % and occupancy 12.5 %, **limited by registers** (the `[128,128]` FP32 accumulator + Q tile). cuDNN on Hopper is FA-3-class — **warp-specialized** (separate producer/consumer warpgroups), **TMA** async loads, and software-pipelined MMA/softmax — which keep the tensor cores fed at ~70 %. The single-program Triton kernel can't express that scheduling, so it stalls at barriers and under-occupies.
 
 Hypothesis / next: the gap is compute-scheduling, not memory. Levers that *might* close some of it (diminishing returns): smaller `BLOCK_M` to cut register pressure / raise occupancy; `tl.dot` with FP8 (accuracy risk); Triton's newer warp-specialization / TMA pipelining (`tl.async`); or a `triton.autotune` over a wider grid. Matching cuDNN would essentially mean re-implementing FA-3 (CUTLASS/CuTe) — a large undertaking. **Conclusion: kept Triton (18.86 ms) as the hand-written best; it's the real learning artifact (correct flash attention, memory wall eliminated), within ~1.5× of FA-3-class cuDNN.**
 
@@ -202,15 +202,15 @@ Lessons: (1) `warp_specialize=True` is a cheap one-liner to *try*, but auto-WS �
 
 Date: 2026-06-27
 
-Thinking: Entry 3 proved the gap to cuDNN is hand-crafted warp-specialization (MMA↔softmax overlap), which Triton's auto-WS can't deliver. Rather than hand-write FA-3 from scratch (months of CuTe work), instantiate **CUTLASS's own Hopper FMHA collective** (bundled example `88_hopper_fmha`) — it *is* FA-3 (warp-specialized + TMA + wgmma cooperative) — via `load_inline`, adapted to our problem.
+Thinking: Entry 3 proved the gap to cuDNN is hand-crafted warp-specialization (MMA↔softmax overlap), which Triton's auto-WS can't deliver. Rather than hand-write FA-3 from scratch (months of CuTe work), instantiate **CUTLASS's own Hopper FMHA collective** (bundled example `88_hopper_fmha`) — it *is* FA-3 (warp-specialized + TMA + wgmma cooperative) — via `load_inline`, adapted to the problem.
 
 Code version: `versions/v3_cutlass_fa3.py` (= `submission.py`).
 
 How it was wired (the CUTLASS learning):
 - `Operation = cutlass::device::Universal< FmhaBuilder<half_t, float, float, TileShape, StrideQ, StrideK, StrideV, DefaultFusion, KernelTmaWarpSpecializedCooperative>::Kernel >`.
 - **TileShape = `Shape<_128,_128,_128>`** (BlockQ, BlockKV, head_dim=128), the example's D=128 cooperative config.
-- **`DefaultFusion`** = non-causal, no residual mask (our seq_lens are multiples of 128); `CausalFusion`/`ResidualFusion` are the other options.
-- Problem shape `(B,H,S,S,D)`; strides map our contiguous `[B,H,S,D]` to the kernel's `(S, D, (B,H))` layout: `stride = (D, _1, (H·S·D, S·D))` — D-major, no copy.
+- **`DefaultFusion`** = non-causal, no residual mask (the seq_lens are multiples of 128); `CausalFusion`/`ResidualFusion` are the other options.
+- Problem shape `(B,H,S,S,D)`; strides map the contiguous `[B,H,S,D]` to the kernel's `(S, D, (B,H))` layout: `stride = (D, _1, (H·S·D, S·D))` — D-major, no copy.
 - **Softmax scale is auto-derived** from D in `to_underlying_arguments` (`1/√d`, `log2(e)/√d`) — matches the reference, nothing to pass.
 - Needed an LSE scratch buffer `[B·H·S]` (ignored). Launch on `at::cuda::getCurrentCUDAStream()` so the harness's event timing is valid. `sys.stdout` guard + pre-build for the spawned-worker JIT (same as swiglu).
 
@@ -224,7 +224,7 @@ Performance (harness benchmark):
 | medium | 12.685 | 2.247 | 1.642 | 1.632 |
 | **large** | **115.04** | **18.86** | **12.79** | 12.76 |
 
-**FA-3 = 12.79 ms ≈ cuDNN's 12.76 ms — library parity** (9.0× over baseline, 1.48× over our Triton). ~573 TF/s (~58 % MFU). Head-to-head in one process, FA-3 14.32 vs cuDNN 14.29 ms.
+**FA-3 = 12.79 ms ≈ cuDNN's 12.76 ms — library parity** (9.0× over baseline, 1.48× over the Triton kernel). ~573 TF/s (~58 % MFU). Head-to-head in one process, FA-3 14.32 vs cuDNN 14.29 ms.
 
 Profiling (ncu, large) vs the Triton kernel:
 
@@ -236,9 +236,9 @@ Profiling (ncu, large) vs the Triton kernel:
 
 Observation:
 - **Same low occupancy (~13 %) and same low DRAM (~4 %), but FA-3 hits 76 % SM vs Triton's 52 %.** That +24 pp is exactly the **warp-specialization** payoff: producer/consumer warpgroups keep the tensor cores fed (MMA overlaps softmax) without needing high occupancy. This *confirms Entry 3's diagnosis* — the bottleneck was compute overlap, not occupancy — and shows the fix that Triton's auto-WS couldn't provide but hand-crafted CUTLASS FA-3 does.
-- cuDNN on Hopper is the same FA-3 lineage, so parity is expected; we didn't beat it, we matched it.
+- cuDNN on Hopper is the same FA-3 lineage, so parity is expected; it wasn't beaten, it was matched.
 
-Conclusion: **Entry 4 (CUTLASS FA-3, 12.79 ms) is the new best — library-parity hand-instantiated FlashAttention-3.** The honest framing: we did *not* hand-write FA-3; we wired CUTLASS's FMHA collective (FmhaBuilder + cooperative WS/TMA dispatch) to our problem. That *is* the realistic "serious CUTLASS-FA3" — and it closes the entire gap (115 → 12.8 ms, matching the vendor library).
+Conclusion: **Entry 4 (CUTLASS FA-3, 12.79 ms) is the new best — library-parity hand-instantiated FlashAttention-3.** The honest framing: FA-3 was *not* hand-written; CUTLASS's FMHA collective (FmhaBuilder + cooperative WS/TMA dispatch) was wired to the problem. That *is* the realistic "serious CUTLASS-FA3" — and it closes the entire gap (115 → 12.8 ms, matching the vendor library).
 
 Lessons: (1) The pragmatic way to "write FA-3" is to instantiate CUTLASS's FMHA collective, not hand-roll CuTe — `FmhaBuilder` + the right fusion/dispatch/tile is ~80 lines via load_inline. (2) ncu nails the mechanism: warp-specialization buys SM utilization (52→76 %) at the *same* occupancy — occupancy and utilization are different things. (3) Unlike swiglu (library was unbeatable), here matching the library by hand is achievable because the vendor kernel *is* open CUTLASS — reuse beats reinvention. (4) Reused everything from the swiglu CUTLASS work: load_inline build deps, sm90a flags, the spawned-worker stdout guard, stream handling.
 
@@ -248,7 +248,7 @@ Lessons: (1) The pragmatic way to "write FA-3" is to instantiate CUTLASS's FMHA 
 
 Date: 2026-06-27
 
-Thinking: Entry 4 matched cuDNN (12.79 vs 12.76). cuDNN's heuristic might not pick the optimal config for our exact shape (non-causal, S=8192, D=128, fp16), so sweep the CUTLASS FMHA knobs: schedule (cooperative vs **pingpong**), TileShape (128×128 vs **128×256**), TileScheduler (individual vs **persistent**), and **accQK=fp16**.
+Thinking: Entry 4 matched cuDNN (12.79 vs 12.76). cuDNN's heuristic might not pick the optimal config for this exact shape (non-causal, S=8192, D=128, fp16), so sweep the CUTLASS FMHA knobs: schedule (cooperative vs **pingpong**), TileShape (128×128 vs **128×256**), TileScheduler (individual vs **persistent**), and **accQK=fp16**.
 
 Results:
 
@@ -271,6 +271,6 @@ Profiling (ncu, large) — pingpong vs the Entry-4 cooperative kernel:
 
 ⇒ **the two are identical in steady-state ncu SoL** (same 76 % SM). Yet pingpong's end-to-end harness time is worse and high-variance (14.64 ms mean, std 0.93) vs cooperative's stable 12.79 ms. So the regression is **not per-kernel compute efficiency** — it's scheduling/launch behavior across the 256·(S/128) tiles (pingpong's two alternating math warpgroups are more sensitive to L2 state / wave quantization under `clear_l2_cache`). A single-kernel ncu profile *cannot* see this; only the full benchmark does.
 
-Conclusion: **nothing beat cooperative 128×128; kept Entry 4 (12.79 ms).** Pingpong looked marginally faster in a quick `perf_counter` loop (14.18 vs coop 14.36) and has identical ncu SoL, but the **authoritative harness** (with `clear_l2_cache` + 100 runs) exposed it as *worse* and high-variance (14.64 ms mean). The 128×256 tiles can't initialize for D=128 on this problem (register/shmem limit). cuDNN parity (12.79 ms, ~58 % MFU) stands as the ceiling — we match the vendor, we don't beat it.
+Conclusion: **nothing beat cooperative 128×128; kept Entry 4 (12.79 ms).** Pingpong looked marginally faster in a quick `perf_counter` loop (14.18 vs coop 14.36) and has identical ncu SoL, but the **authoritative harness** (with `clear_l2_cache` + 100 runs) exposed it as *worse* and high-variance (14.64 ms mean). The 128×256 tiles can't initialize for D=128 on this problem (register/shmem limit). cuDNN parity (12.79 ms, ~58 % MFU) stands as the ceiling — the vendor is matched, not beaten.
 
 Lessons: (1) **Trust the harness measurement, not quick loops** — without `clear_l2_cache` + enough iters, pingpong looked best but was actually worse + noisy. (2) cuDNN's default config (cooperative-ish) is already optimal for this shape; the easy knobs don't beat it. (3) Beating cuDNN would need something cuDNN doesn't do for fp16 (e.g. FP8 — but that fails the fp16 1e-2 tolerance) — diminishing returns; matched is the right place to stop.
