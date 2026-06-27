@@ -16,32 +16,58 @@ Key workload:
 
 Append one entry per meaningful experiment.
 
-### Entry 0 - Baseline
+### Roofline (the target)
 
-Date:
+Per (b,h): two matmuls, each `2·S²·D` FLOP, + a softmax over an S×S matrix.
+Large case (B=4, N=64, S=8192, D=128): BN=256 (b,h) pairs.
 
-Code version:
-- File(s):
-- Short description:
+| Quantity | Value |
+|----------|-------|
+| Total FLOPs (2 GEMMs) | 2·(2·B·N·S²·D) ≈ **8.8 TFLOP** |
+| Compute floor (FP16 TC ~990 TF/s) | **~9 ms** |
+| S×S scores matrix per `[B,N,S,S]` (fp16) | **34 GB** (×2 with probs ⇒ 68 GB resident) |
+| Flash-attention HBM (Q+K+V+O only) | **~2.15 GB** ⇒ ~0.6 ms at 3.35 TB/s |
 
-Command:
-```bash
-python ../eval.py benchmark test_cases/test.txt
-```
+⇒ exact attention is ~9 ms of compute. The baseline pays ~13× that because it **materializes and re-streams the 34 GB S×S matrix** (the O(N²) memory wall). Flash-attention's job: never write S×S, approach the ~9 ms floor.
 
-Correctness:
-- Status:
-- Notes:
+Hardware: H100 80GB HBM3 (Nebius VM), CUDA 13, torch 2.12. FP16 inputs, tol `rtol=atol=1e-2`.
 
-Performance:
-- Runtime:
-- Profiler stats:
+---
 
-Observation:
-- What seems to limit performance?
+### Entry 0 — Baseline (PyTorch reference, naive 3-op attention)
+
+Date: 2026-06-27
+
+Code version: `submission.py` = `reference.ref_kernel` — `scores = q@kᵀ/√d; p = softmax(scores); out = p@v`. Materializes the full `[B,N,S,S]` scores + probs.
+
+Command: `./run.sh flashattention benchmark`
+
+Correctness: **pass** (custom == reference).
+
+Performance (harness benchmark):
+
+| case (B,N,S,D) | runtime |
+|----------------|---------|
+| small (1,64,1024,128) | 0.344 ms |
+| medium (2,64,4096,128) | 12.685 ms |
+| **large (4,64,8192,128)** | **115.04 ms** |
+
+Profiling — stage breakdown on the large case (CUDA events; matches harness full() = 114.87 ms):
+
+| stage | time | what limits it |
+|-------|------|----------------|
+| `QK^T` GEMM (+scale) | 13.5 ms | **memory-bound**: writes 34 GB scores @ ~2.5 TB/s (only 326 TF/s of 990 peak) |
+| softmax | **66.9 ms** | **memory-bound**: reads+writes ~69 GB @ only **1.03 TB/s** (wide-row softmax, multiple passes) |
+| `PV` GEMM | 14.0 ms | **memory-bound**: reads 34 GB probs @ ~2.45 TB/s |
+| scale/elementwise + overhead | ~20 ms | extra 34 GB passes |
+| peak memory | **71 GB** | 34 GB scores + 34 GB probs resident (barely fits 80 GB; larger ⇒ OOM) |
+
+Observation — what limits performance:
+- **The two GEMMs would be ~9 ms at peak; the baseline is 115 ms (~13×).** Almost none of it is real compute — both GEMMs run at ~2.5 TB/s (memory-bound, not compute-bound) because they write/read the 34 GB S×S matrix, and **softmax alone is 67 ms (58%)** streaming 69 GB at a poor 1.03 TB/s.
+- This is the textbook **O(N²) memory wall**: ~106 of the 115 ms is moving the S×S scores/probs through HBM, not computing.
+- Note (process): my first profiling pass was wrong — I called `generate_input(B,N,S,D)` positionally, but its signature is `(batch, heads, head_dim, seq_len, seed)` (head_dim before seq_len), so I accidentally profiled S=128/D=8192 and got an impossible 0.76 ms. The harness (keyword args) was right. Fixed by calling with keywords; numbers above are correct.
 
 Hypothesis:
-- What change should improve it, and why?
+- **FlashAttention**: tile Q/K/V, compute attention block-by-block in SRAM with **online softmax**, never materializing S×S. HBM traffic drops from ~34 GB×(several passes) to ~2.15 GB (Q/K/V/O) ⇒ becomes compute-bound, should approach the ~9 ms floor. PyTorch's `F.scaled_dot_product_attention` (cuDNN/flash) is the library reference (README: ~28 ms large, ~4.5×).
 
-Next step:
-- 
+Next step (Entry 1): drop-in `F.scaled_dot_product_attention(q,k,v)` — the library FlashAttention; measure the ~4.5× and set the bar a hand-written kernel must beat.
