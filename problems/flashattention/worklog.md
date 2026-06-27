@@ -71,3 +71,39 @@ Hypothesis:
 - **FlashAttention**: tile Q/K/V, compute attention block-by-block in SRAM with **online softmax**, never materializing S×S. HBM traffic drops from ~34 GB×(several passes) to ~2.15 GB (Q/K/V/O) ⇒ becomes compute-bound, should approach the ~9 ms floor. PyTorch's `F.scaled_dot_product_attention` (cuDNN/flash) is the library reference (README: ~28 ms large, ~4.5×).
 
 Next step (Entry 1): drop-in `F.scaled_dot_product_attention(q,k,v)` — the library FlashAttention; measure the ~4.5× and set the bar a hand-written kernel must beat.
+
+---
+
+### Entry 1 — `F.scaled_dot_product_attention` (library FlashAttention)
+
+Date: 2026-06-27
+
+Thinking: the win is killing the S×S materialization (Entry 0). PyTorch's SDPA already wraps fused FlashAttention backends; its defaults match the reference exactly (`scale = 1/√d`, `is_causal=False`). One-liner.
+
+Code version: `versions/v1_sdpa.py` (= `submission.py`): `return F.scaled_dot_product_attention(q, k, v)`.
+
+Correctness: **pass** (all 3 cases).
+
+Performance (harness benchmark):
+
+| case (B,N,S,D) | baseline | SDPA | speedup |
+|----------------|----------|------|---------|
+| small (1,64,1024,128) | 0.344 ms | 0.063 ms | 5.5× |
+| medium (2,64,4096,128) | 12.685 ms | 1.632 ms | 7.8× |
+| **large (4,64,8192,128)** | **115.04 ms** | **12.76 ms** | **9.0×** |
+
+Backend comparison (large, `torch.nn.attention.sdpa_kernel`, my-loop timing):
+
+| backend | time | note |
+|---------|------|------|
+| **cuDNN** | **14.1 ms** | default dispatcher picks this ⇒ harness 12.76 ms |
+| Flash (FA-2) | 24.6 ms | the classic flash-attn; matches README's "28 ms" |
+| mem-efficient | 47.9 ms | xformers-style |
+
+Observation:
+- **SDPA (cuDNN) = 12.76 ms, 9× over baseline.** Achieves 8.8 TFLOP / 12.76 ms ≈ **690 TF/s (~70 % of FP16 peak)** — i.e. it's now **compute-bound and near the ~9 ms floor**, exactly as the roofline predicted once the S×S traffic is gone. Peak memory drops from 71 GB to a few GB (no S×S).
+- The default backend is **cuDNN**, which is ~2× faster than the bundled FA-2 "flash" backend (14 vs 24.6 ms) — on Hopper cuDNN is FA-3-class (wgmma + TMA + warp-specialization). The README's 28 ms was the FA-2 backend; cuDNN moved the bar much lower.
+
+Hypothesis / next: a hand-written Triton FlashAttention (online softmax + tiling) is the learning goal. **Bar to beat: cuDNN's ~12.76 ms** (≈70 % MFU) — a high bar (same lesson as swiglu: the library is near-peak). Realistic aim: learn the algorithm and get within ~1.5–2× of cuDNN; matching/beating it would need FA-3-level Hopper engineering (CUTLASS/CuTe). Correctness regime is friendly (FP16, tol 1e-2, FP32 online-softmax accumulators are *more* accurate than the reference), unlike swiglu's TF32 self-reference trap.
+
+Next step (Entry 2): hand-written Triton FlashAttention; measure vs the 12.76 ms cuDNN bar.
