@@ -111,7 +111,106 @@ Conclusion / lesson:
 
 ---
 
-### Entry 2 — Fused CUDA kernel, coalesced read, global atomics
+### Entry 2 — Best-effort Triton (before dropping to CUDA): three approaches
+
+Date: 2026-06-27
+
+Thinking: Entry 1 left us at a clear decision point — strided over-fetch is the
+root cause, a physical transpose just relocates it, so the answer is a **fused
+single-pass kernel that reads once, coalesced**. Before hand-writing CUDA, what
+is the *best a competent Triton author* can do here? Triton is the obvious reach
+for a fused kernel. The catch: Triton hides shared memory (SRAM is auto-managed)
+and offers **no cheap privatized scatter**, which turns out to be exactly the
+optimization that makes histogram fast. So this entry tries all three Triton
+expressions and measures each, to find Triton's real ceiling on this problem.
+
+The Triton trilemma — you cannot get {coalesced read + cheap counting + no
+atomics} at once:
+
+- **A. Global atomics** (`tl.atomic_add` per element). Coalesced read (a program
+  owns a strip of consecutive channels), but the scatter is one global atomic per
+  element → the same wall as CUDA's global-atomic version.
+- **B. One-hot privatization** (the "Triton-idiomatic" no-atomics answer, the
+  moral equivalent of CUDA shared-mem sub-histograms). Build a private
+  `[NUM_BINS, BLOCK_C]` histogram in registers by comparing the loaded tile
+  against all bins (3D broadcast) and `tl.sum`-reducing over rows; flush once.
+  No per-element atomics — but pays a **NUM_BINS× compute blow-up** (256
+  comparisons per element) and there is no cheap scatter into a register
+  accumulator.
+- **C. Built-in `tl.histogram`**. Efficient counting, but it reduces a *flattened
+  1D block*, so it can't keep channels separate → each program must own **one
+  channel** and read that channel's **column**, which is strided by C=512 → the
+  ~64× over-fetch of Entry 0/1 returns.
+
+Code versions: `versions/v2a_triton_atomics.py`, `v2b_triton_onehot.py`,
+`v2c_triton_tl_histogram.py`. Each defines `custom_kernel` directly (no
+`wrap_cuda_submission.py` — that is only for `.cu`).
+
+Hardware/stack: same H100 (Nebius), torch 2.12.1+cu130, **triton 3.7.1**, ncu 2025.3.1.
+
+Correctness: **all three pass.**
+
+Performance (benchmark mean):
+
+| Variant | Runtime | vs CUDA fused (Entry 3, 6.77 ms) | vs ideal 160 µs |
+|---------|---------|----------------------------------|-----------------|
+| A. global atomics | 11.035 ms (best 10.810) | 1.6× **slower** | ~69× |
+| B. one-hot privatize | **629.181 ms** | ~93× slower | ~3900× |
+| **C. `tl.histogram` (strided)** | **4.107 ms** (best 3.848) | **1.6× faster** | ~26× |
+
+Profiler stats (ncu) — the bottleneck for each:
+
+| Metric | A atomics | B one-hot | C tl.histogram |
+|--------|-----------|-----------|----------------|
+| Duration | 11.59 ms | (783 ms under ncu) | 4.12 ms |
+| **DRAM_Read** | 515 MB (once ✓) | — | **1.75 GB** (over-fetch back, but ~3.4× not 64×) |
+| L2→L1 / L1→L2 | 16.5 / 16.0 GB | — | **16.0 GB** L2→L1 |
+| **Bottleneck pipe** | **L2 87.96%** | **L1/TEX 97.13%** | **L2 91.62%** |
+| DRAM_Throughput | 1.40% | 0.03% | 13.66% |
+| L2_Cache_Hit_Rate | 98.69% | — | 88.55% |
+| Compute (SM) | 9.48% | 14.70% | 57.45% |
+| Achieved Occupancy | — | **12.43%** | — |
+
+Observation — what each result teaches:
+
+- **A (11.0 ms) reproduces CUDA Entry 3's wall exactly** — 16 GB of L1↔L2 atomic
+  traffic, L2 saturated at 88%, DRAM idle (1.4%). Same picture as v2 (16 GB, L2
+  88%, DRAM 2.35%), but **~1.7× slower** (11.59 vs 6.85 ms): Triton's atomic
+  codegen + masked 2D pointer arithmetic is less efficient than the hand-rolled
+  CUDA. L2 is already saturated, so tuning BLOCK_C/BLOCK_R cannot help.
+- **B (629 ms) is the catastrophic one** — the no-atomics privatization that wins
+  in CUDA is a disaster in Triton. It is **L1/TEX-pipe bound (97%) with 12%
+  occupancy**: the 256× one-hot materialization (`[NUM_BINS, BLOCK_R, BLOCK_C]`
+  intermediates) thrashes the L1/TEX pipe, and the `[256, BLOCK_C]` register
+  accumulator crushes occupancy. SM/compute is only 15% — the work is moving
+  data through the SRAM pipe, not computing. One-hot is only viable for *small*
+  bin counts; at 256 it is ~57× slower than even the naive atomic version.
+- **C (4.1 ms) is the surprise winner** — and beats CUDA's naive fused-atomic v2.
+  The strided column read *does* bring over-fetch back, but only ~3.4× (1.75 GB),
+  not 64×: all 512 "one-channel" programs run concurrently and **share each
+  row's 512 bytes in L2** (L2 hit 88.55%), so the over-fetch is absorbed by L2
+  (16 GB L2→L1) instead of hammering DRAM. Combined with `tl.histogram`'s
+  atomic-free counting, it lands at 4.1 ms — **L2-bound** at 91.6%.
+
+Conclusion — **best-effort Triton ≈ 4.1 ms (Variant C)**, respectable (it beats
+the naive CUDA fused-atomic kernel) but it **plateaus ~12× behind hand-written
+CUDA's best (0.343 ms) and ~26× off the 160 µs roofline.** The reason is
+structural, not a tuning miss: the step that takes CUDA from 6.77 ms → 0.816 ms
+(Entry 3→4: shared-memory privatized sub-histograms, coalesced) requires
+user-managed shared memory and cheap shared-atomics — and **Triton's abstraction
+has no equivalent.** Its three escape hatches each fail differently: A can't
+privatize (L2-atomic wall), B privatizes but the one-hot is compute-catastrophic,
+C counts efficiently but pays strided reads. Triton excels at fused
+elementwise/matmul shapes; histogram's privatized-scatter pattern is precisely
+where giving up shared-memory control costs you the key optimization.
+
+Next step: to break past 4 ms we must hand-manage shared memory — i.e. drop to
+CUDA. Entry 3 is the same idea as Variant A (fused, coalesced, global atomics)
+but in CUDA, which then unlocks the shared-mem privatization Triton can't express.
+
+---
+
+### Entry 3 — Fused CUDA kernel, coalesced read, global atomics
 
 Date: 2026-06-24
 
@@ -151,7 +250,7 @@ Hypothesis / next step:
 
 ---
 
-### Entry 3 — Shared-memory privatized sub-histograms (channel-tiled)
+### Entry 4 — Shared-memory privatized sub-histograms (channel-tiled)
 
 Date: 2026-06-24
 
@@ -178,7 +277,7 @@ Profiler stats (`hist_kernel`, 856 µs):
 | DRAM_Throughput | 18.9% | up from 2.35%, still not saturated |
 | L2 / L1 / Compute thru | 34% / 43% / 35% | **nothing saturated** |
 | **Achieved occupancy** | **95.3%** | occupancy is NOT the limiter |
-| **Shared-atomic bank conflicts** | **42.6 M** | ← suspected bottleneck — **WRONG**, disproven in Entry 4 |
+| **Shared-atomic bank conflicts** | **42.6 M** | ← suspected bottleneck — **WRONG**, disproven in Entry 5 |
 
 Observation:
 - Shared-memory privatization worked: L2 traffic collapsed 16 GB → 64 MB; L2 no longer the wall.
@@ -188,26 +287,26 @@ Hypothesis / next step (v4):
 - Pad the per-channel stride 256 → 257: `s[lc*257 + v]` ⇒ bank = `(lc+v) mod 32` (257 mod 32 = 1). A warp's lc = 0..31 then spreads across all 32 banks regardless of value → conflict-free. Shared cost 32 KB → 32.1 KB (negligible). Re-measure bank conflicts and whether we become DRAM-bound.
 - If same-address atomic contention (row-lanes hitting the same `(lc,v)`) shows up next, consider replicated sub-histograms.
 
-> ⚠️ **Correction (after Entry 4):** the "bank conflicts are the bottleneck" attribution above was **wrong** — inferred from a nonzero metric without measuring warp stall reasons. Padding (Entry 4) disproved it; the real bottleneck is global-load latency. Kept here to show the (mistaken) reasoning at the time.
+> ⚠️ **Correction (after Entry 5):** the "bank conflicts are the bottleneck" attribution above was **wrong** — inferred from a nonzero metric without measuring warp stall reasons. Padding (Entry 5) disproved it; the real bottleneck is global-load latency. Kept here to show the (mistaken) reasoning at the time.
 
 ---
 
-### Entry 4 — Bank-conflict padding (256 → 257) — NO EFFECT (failed)
+### Entry 5 — Bank-conflict padding (256 → 257) — NO EFFECT (failed)
 
 Date: 2026-06-24
 
 Thinking: pad shared stride to 257 to make bank = `(lc+v) mod 32`, expecting conflict-free shared atomics.
 
-Code version (`submission.cu`): `SPADC = BINS+1 = 257`; `s[lc*spad + v]`; shared 32 KB → 32.1 KB. Everything else identical to Entry 3.
+Code version (`submission.cu`): `SPADC = BINS+1 = 257`; `s[lc*spad + v]`; shared 32 KB → 32.1 KB. Everything else identical to Entry 4.
 
 Correctness: **pass**
 
 Performance:
-- **Runtime: 0.813 ms** (mean of 5) — **unchanged** from Entry 3 (0.816 ms).
+- **Runtime: 0.813 ms** (mean of 5) — **unchanged** from Entry 4 (0.816 ms).
 
 Profiler stats:
 
-| Metric | Entry 3 | Entry 4 (padded) |
+| Metric | Entry 4 | Entry 5 (padded) |
 |--------|---------|------------------|
 | Shared-atomic bank conflicts | 42.6 M | **42.99 M (unchanged)** |
 | Achieved occupancy | 95.3% | 95.7% |
@@ -216,7 +315,7 @@ Profiler stats:
 
 Why it failed (the lesson):
 - My padding reasoning assumed all threads in a warp write the **same** value v (then bank = `(lc+v)%32` is a perfect permutation). But the data is **uniform-random**: each lane's `v_lc` is independent → bank = `(lc+v_lc)%32` is still random → **same conflict rate**. **Padding only removes bank conflicts for correlated/identical writes; for random values it does nothing.**
-- More importantly, padding moving the runtime by ~0 shows **bank conflicts were never the real bottleneck** (42.6 M conflicts is only ~8% of the 537 M shared atomics; the Entry-3 hypothesis was wrong).
+- More importantly, padding moving the runtime by ~0 shows **bank conflicts were never the real bottleneck** (42.6 M conflicts is only ~8% of the 537 M shared atomics; the Entry-4 hypothesis was wrong).
 
 Re-diagnosis attempt #1 (ALSO WRONG): I then guessed "raw shared-atomic throughput" — again from indirect signals, without measuring. Disproven below.
 
@@ -233,7 +332,7 @@ Re-diagnosis #2 — measured warp stall reasons (the *direct* signal):
 
 **True bottleneck: global-load latency (latency-bound).** `mio_throttle ≈ 0` proves shared atomics are NOT the limiter; `short_scoreboard ≈ 0` rules out shared memory / bank conflicts; DRAM at 19% rules out bandwidth. Warps stall on `long_scoreboard` because each thread does **1-byte load → dependent atomicAdd → …**: memory-level parallelism is too low to hide the ~hundreds-of-cycles global load latency, even at 95% occupancy.
 
-**Method lesson (this cost two wrong calls — Entry 3 bank-conflicts, and re-diagnosis #1):** when no resource is saturated, **pull the stall-reason breakdown before naming a bottleneck.** Do not infer causation from a metric merely being nonzero/large (42.6 M bank conflicts looked damning but was ~8% noise).
+**Method lesson (this cost two wrong calls — Entry 4 bank-conflicts, and re-diagnosis #1):** when no resource is saturated, **pull the stall-reason breakdown before naming a bottleneck.** Do not infer causation from a metric merely being nonzero/large (42.6 M bank conflicts looked damning but was ~8% noise).
 
 Corrected implication: the ~160 µs read roofline may actually be **reachable** — DRAM sits at 19% because we're latency-bound, not because counting is intrinsically expensive. Hiding the load latency should let DRAM throughput climb.
 
@@ -241,11 +340,11 @@ Next step (v5): raise memory-level parallelism to hide the load — **vectorized
 
 ---
 
-### Entry 5 — Row-loop unroll (×8) on the v3 base; padding reverted
+### Entry 6 — Row-loop unroll (×8) on the v3 base; padding reverted
 
 Date: 2026-06-24
 
-Thinking: Entry 4 diagnosed latency-bound on the global load. v4's padding was a no-op, so reverted it (back to the clean v3 layout, `s[lc*num_bins+v]`) and instead raised memory-level parallelism: unroll the grid-stride row loop by UNROLL=8 so each thread issues 8 *independent* loads (into registers) before the 8 dependent atomics → 8 loads in flight to hide the ~hundreds-of-cycles load latency.
+Thinking: Entry 5 diagnosed latency-bound on the global load. v4's padding was a no-op, so reverted it (back to the clean v3 layout, `s[lc*num_bins+v]`) and instead raised memory-level parallelism: unroll the grid-stride row loop by UNROLL=8 so each thread issues 8 *independent* loads (into registers) before the 8 dependent atomics → 8 loads in flight to hide the ~hundreds-of-cycles load latency.
 
 Code version (`submission.cu`): v3 + `#define UNROLL 8`; unrolled body loads `v[8]` then does 8 `atomicAdd`. Same mapping/grid as v3. Read-once bijection unchanged (loads just regrouped).
 
@@ -265,14 +364,14 @@ Validation (re-measured stall reasons — diagnosis confirmed, not assumed):
 | short_scoreboard | 0.13 | 0.95 | shared memory emerging |
 
 Observation:
-- The latency-bound diagnosis is **confirmed by experiment**: adding MLP dropped `long_scoreboard` 38→6 and doubled DRAM throughput. This is the validation that Entry 3/4's guesses lacked.
+- The latency-bound diagnosis is **confirmed by experiment**: adding MLP dropped `long_scoreboard` 38→6 and doubled DRAM throughput. This is the validation that Entry 4/5's guesses lacked.
 - New state is more balanced: `long_scoreboard` (6.0) still the top stall but much smaller; shared-atomic (`mio_throttle` 1.94) and shared-memory (`short_scoreboard` 0.95) now visible. DRAM at 39% ⇒ ~2.5× headroom to bandwidth saturation.
 
 Next step (v5b): vectorized loads — each thread reads `uchar4`/`int` (4 channels) per load → 4× fewer load instructions and more bytes/request, pushing DRAM higher. Also consider larger UNROLL. Watch whether shared atomics (`mio_throttle`) become the next wall.
 
 ---
 
-### Entry 6 — Vectorized int loads (4 ch/thread) + unroll — SLOWER (failed)
+### Entry 7 — Vectorized int loads (4 ch/thread) + unroll — SLOWER (failed)
 
 Date: 2026-06-24
 
@@ -303,7 +402,7 @@ Decision: **keep v5a (0.359 ms, 143×) as the best version.** Reverted `submissi
 
 ---
 
-### Entry 7 — Grid/block sweep (launch-config tuning) — FINAL
+### Entry 8 — Grid/block sweep (launch-config tuning) — FINAL
 
 Date: 2026-06-25
 
@@ -344,15 +443,20 @@ Conclusion — **STOP here.** Higher occupancy / more grid tuning won't help: th
 |---------|---------|-------------|----------------------|
 | Entry 0 baseline (PyTorch) | 51.31 ms | 1× | — |
 | Entry 1 transpose (PyTorch) | 45.36 ms | 1.13× | (failed: over-fetch relocated) |
-| Entry 2 fused, global atomics | 6.77 ms | 7.6× | strided over-fetch → read once |
-| Entry 3 shared-mem privatized | 0.816 ms | 63× | global-atomic L2 traffic |
-| Entry 4 bank-conflict padding | 0.813 ms | 63× | (failed: no effect) |
-| Entry 5 row-unroll ×8 | 0.359 ms | 143× | global-load latency (MLP) |
-| Entry 6 vectorized int loads | 0.400 ms | 128× | (failed: occupancy crash) |
-| **Entry 7 grid/block tuning** | **0.343 ms** | **~150×** | flush-atomic count (launch config) |
+| Entry 2 best-effort Triton (C: `tl.histogram`) | 4.107 ms | 12.5× | Triton's ceiling — L2-bound, no shared-mem privatization |
+| Entry 3 fused CUDA, global atomics | 6.77 ms | 7.6× | strided over-fetch → read once |
+| Entry 4 shared-mem privatized | 0.816 ms | 63× | global-atomic L2 traffic |
+| Entry 5 bank-conflict padding | 0.813 ms | 63× | (failed: no effect) |
+| Entry 6 row-unroll ×8 | 0.359 ms | 143× | global-load latency (MLP) |
+| Entry 7 vectorized int loads | 0.400 ms | 128× | (failed: occupancy crash) |
+| **Entry 8 grid/block tuning** | **0.343 ms** | **~150×** | flush-atomic count (launch config) |
+
+(Entry 2 is a side branch — best-effort Triton, not on the CUDA optimization
+line. Its three variants: A global-atomics 11.0 ms, B one-hot privatize 629 ms,
+C `tl.histogram` 4.107 ms. Best Triton ≈ 4.1 ms, ~12× behind the CUDA best.)
 
 **Final: 0.343 ms, ~150× over baseline, ~2.1× off the 160 µs read roofline** (code: `versions/v7_grid_tuned.cu`).
 
 Why stop: the kernel is now **L1TEX/shared-memory-pipe bound** (91.6%) on the 537 M shared atomics — the intrinsic cost of counting. DRAM is only ~41%, so it's no longer memory-bound; the read roofline is unreachable because counting, not reading, now dominates. Remaining gains need an algorithmic change (fewer atomics), which is low-ROI.
 
-Key lessons recorded along the way: (1) strided column access over-fetches ~64×; read once, coalesced. (2) a physical transpose just relocates the over-fetch. (3) when nothing is saturated, read **warp stall reasons** before naming a bottleneck — guessing cost two wrong calls (bank conflicts, "shared-atomic throughput"). (4) padding only fixes bank conflicts for correlated writes, not random data. (5) occupancy is a means (latency hiding) with diminishing returns — 90%+ occupancy didn't prevent being latency-bound; ILP (unroll) fixed it. (6) optimization migrates the bottleneck until you hit an intrinsic resource limit.
+Key lessons recorded along the way: (1) strided column access over-fetches ~64×; read once, coalesced. (2) a physical transpose just relocates the over-fetch. (3) when nothing is saturated, read **warp stall reasons** before naming a bottleneck — guessing cost two wrong calls (bank conflicts, "shared-atomic throughput"). (4) padding only fixes bank conflicts for correlated writes, not random data. (5) occupancy is a means (latency hiding) with diminishing returns — 90%+ occupancy didn't prevent being latency-bound; ILP (unroll) fixed it. (6) optimization migrates the bottleneck until you hit an intrinsic resource limit. (7) Triton (Entry 2) has no cheap privatized scatter — without user-managed shared memory it tops out ~12× behind hand CUDA on histogram: global atomics hit the L2 wall, one-hot privatization is a 256× compute disaster, and the built-in `tl.histogram` is fast but forces strided per-channel reads. Pick the tool to the access pattern: histogram's scatter wants explicit SRAM, which is CUDA's turf.
