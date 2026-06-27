@@ -238,3 +238,35 @@ Profiling — per-kernel breakdown of the H2 fast path (torch.profiler, 20 calls
 Conclusion: **Entry 5 (1.954 ms guarded) is the new best — the first hand-written kernel to beat the PyTorch baseline on this problem.** The win is one cuBLAS GEMM (0.98 ms) replaced by the faster CUTLASS gate GEMM (0.817 ms) while `value` stays cuBLAS for correctness, epilogue Inductor-fused. Headroom remains: an EVT epilogue fusing `silu(gate+b)*(value+c)` into the CUTLASS gate GEMM (reading `value` as an aux tensor) would drop the separate epilogue pass → est. ~1.83 ms.
 
 Lessons: (1) **Measure correctness in the *real* configuration** — the TF32 flag changes what the reference *is*; comparing against the wrong reference (full FP32) produced a 1000× overstated error and a wrong "impossible" conclusion. (2) **Trust the error model + data over intuition**: silu's bounded *derivative* protects the gate path, not the other way around. (3) The right question wasn't "match cuBLAS bit-for-bit" but "which factor's error does the nonlinearity *amplify*" — protect that one, approximate the other. (4) A `data_ptr`-keyed validate-then-fallback guard turns a *usually*-correct fast path into an *always*-correct kernel at zero timed cost (when the harness fixes data). (5) Entry 4's GEMM work wasn't wasted — it's exactly the fast gate GEMM that makes Entry 5 win.
+
+---
+
+### Entry 6 — CUTLASS 3.x EVT: fuse the epilogue into the gate GEMM — works, but NO speedup
+
+Date: 2026-06-27
+
+Thinking: Entry 5's epilogue is a separate 253 µs memory-bound kernel. Fuse `silu(gate+b)*(value+c)` *into* the CUTLASS gate GEMM via an Epilogue Visitor Tree (EVT) so there's no standalone epilogue and no `gate` materialization. Hypothesis (from Entry 5's ncu): the gate GEMM has DRAM headroom (34 %), so the epilogue traffic should hide under its compute → est. ~1.8 ms.
+
+Code version: `versions/v6_evt_fused.py` (record artifact; validated in `tmp/evt_test.py`).
+
+EVT construction (the CUTLASS learning):
+- Tree: `mul( silu( add(acc, b) ), add( SrcFetch(C), c ) )`, built with `Sm90EVT<Sm90Compute<op>, children...>` over `Sm90AccFetch`, `Sm90RowBroadcast<0,TileShape,float>` (b,c), `Sm90SrcFetch<float>` (value), and `Sm90Compute<cutlass::plus / multiplies / epilogue::thread::SiLu, ...>`.
+- **Trick to avoid `Sm90AuxLoad`** (which needs builder-internal copy atoms/stage counts that are painful to specify by hand): pass `value` (cuBLAS output) as the GEMM's **source `C` tensor** and read it with `Sm90SrcFetch` — the builder wires C's TMA load for free. b,c are per-column → `Sm90RowBroadcast` (Stages=0).
+- Pass the EVT as the **last template arg** to the epilogue `CollectiveBuilder` (the `FusionOpOrCallbacks` slot, à la example 49).
+- Runtime args are nested `{first_child, ..., last_child, op_args}` recursively, with top-level epilogue `{ {thread_evt_args}, ptr_C=value, stride_C, ptr_D=out, stride_D }`.
+
+Correctness: **pass** — EVT math vs torch with the *same* gate = 4e-4 (validates the tree); vs harness ref `allclose` **True, 0 violations** (identical to Entry 5's H2, as expected — same numerical paths).
+
+Performance — **no improvement**:
+
+| | time |
+|---|---|
+| fused gate-GEMM-with-epilogue (alone) | 0.981 ms (plain gate was 0.735 ms) |
+| full pipeline (cuBLAS value 0.816 + fused gate 0.981) | **1.972 ms** |
+| Entry 5 (non-fused) | 1.954 ms |
+
+Why it's a wash (traffic analysis): the plain gate GEMM writes only `gate` (256 MB), already hidden (compute-bound). The fused gate GEMM instead **reads `value` (256 MB)** + writes `out` in its epilogue → +0.246 ms, which ≈ the standalone epilogue (0.253 ms) it eliminates. The "34 % DRAM headroom" is a **whole-kernel average dominated by the compute-bound mainloop**; the **epilogue *phase* is memory-bound**, so the extra value-read isn't hidden under mainloop compute. Fusion removed the already-cheap `gate` write but paid the full `value` read — net zero.
+
+Conclusion: **kept Entry 5 (1.954 ms) as best.** The EVT is correct and is real CUTLASS skill (custom visitor tree + source-tensor trick + nested args), but it doesn't beat Entry 5. The only fusion that would genuinely help is a **single dual-GEMM** computing both `gate` and `value` in one kernel (eliminating *both* materializations, writing only `out`) — but that needs CUTLASS for `value` too (→ the BOTH-cutlass correctness case, 1–3 elem off, guard-dependent) and a custom dual-accumulator mainloop (much harder). Not pursued.
+
+Lessons: (1) **"DRAM headroom" from whole-kernel ncu averages does not mean an epilogue add-on is free** — the epilogue phase has its own (memory-bound) profile; reason about the *phase*, not the kernel average. (2) Fusing only helps if it removes traffic that *wasn't already hidden*; here it traded a hidden `gate` write for an unhidden `value` read. (3) The CUTLASS EVT mechanics (SrcFetch-as-aux trick, RowBroadcast, nested args) now work end-to-end — reusable for problems where the fused factor is *computed in the same kernel* (then it's a real win).
