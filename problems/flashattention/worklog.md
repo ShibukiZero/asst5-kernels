@@ -193,3 +193,49 @@ Observation:
 Conclusion: **~18 ms is the ceiling for this (standard) Triton flash-attention formulation; kept Entry 2 (18.86 ms) as the hand-written best.** The remaining 1.48× to cuDNN is FA-3-level Hopper scheduling (warp-specialized producer/consumer + TMA + software-pipelined MMA/softmax). Triton's automatic `warp_specialize` doesn't deliver it; closing the gap would require either a deep TMA + manual-pipeline Triton rewrite (uncertain — the one untried lever, but DRAM is only 3 % so loads aren't the bottleneck) or hand-written **CUTLASS/CuTe FA-3** (very large effort). Not pursued — diminishing returns, same lesson as swiglu (the vendor library is near-peak; hand-written gets close but the last ~1.5× needs vendor-level engineering).
 
 Lessons: (1) `warp_specialize=True` is a cheap one-liner to *try*, but auto-WS ≠ hand-crafted FA-3 WS — don't expect the FA-3 speedup for free. (2) When ncu says "occupancy-limited," verify by *raising* occupancy — here every attempt was slower, proving the diagnosis (occupancy) was a symptom, not the cause (compute overlap). (3) Record the dead ends: WS, num_warps, maxnreg all explored and rejected with numbers.
+
+---
+
+### Entry 4 — CUTLASS FA-3 (Hopper FMHA) — matches cuDNN ✅
+
+Date: 2026-06-27
+
+Thinking: Entry 3 proved the gap to cuDNN is hand-crafted warp-specialization (MMA↔softmax overlap), which Triton's auto-WS can't deliver. Rather than hand-write FA-3 from scratch (months of CuTe work), instantiate **CUTLASS's own Hopper FMHA collective** (bundled example `88_hopper_fmha`) — it *is* FA-3 (warp-specialized + TMA + wgmma cooperative) — via `load_inline`, adapted to our problem.
+
+Code version: `versions/v3_cutlass_fa3.py` (= `submission.py`).
+
+How it was wired (the CUTLASS learning):
+- `Operation = cutlass::device::Universal< FmhaBuilder<half_t, float, float, TileShape, StrideQ, StrideK, StrideV, DefaultFusion, KernelTmaWarpSpecializedCooperative>::Kernel >`.
+- **TileShape = `Shape<_128,_128,_128>`** (BlockQ, BlockKV, head_dim=128), the example's D=128 cooperative config.
+- **`DefaultFusion`** = non-causal, no residual mask (our seq_lens are multiples of 128); `CausalFusion`/`ResidualFusion` are the other options.
+- Problem shape `(B,H,S,S,D)`; strides map our contiguous `[B,H,S,D]` to the kernel's `(S, D, (B,H))` layout: `stride = (D, _1, (H·S·D, S·D))` — D-major, no copy.
+- **Softmax scale is auto-derived** from D in `to_underlying_arguments` (`1/√d`, `log2(e)/√d`) — matches the reference, nothing to pass.
+- Needed an LSE scratch buffer `[B·H·S]` (ignored). Launch on `at::cuda::getCurrentCUDAStream()` so the harness's event timing is valid. `sys.stdout` guard + pre-build for the spawned-worker JIT (same as swiglu).
+
+Correctness: **pass** all 3 cases (large max abs diff 0.0006).
+
+Performance (harness benchmark):
+
+| case | baseline | Triton (E2) | **FA-3 (E4)** | cuDNN (E1) |
+|------|----------|-------------|---------------|------------|
+| small | 0.344 | 0.094 | 0.071 | 0.063 |
+| medium | 12.685 | 2.247 | 1.642 | 1.632 |
+| **large** | **115.04** | **18.86** | **12.79** | 12.76 |
+
+**FA-3 = 12.79 ms ≈ cuDNN's 12.76 ms — library parity** (9.0× over baseline, 1.48× over our Triton). ~573 TF/s (~58 % MFU). Head-to-head in one process, FA-3 14.32 vs cuDNN 14.29 ms.
+
+Profiling (ncu, large) vs the Triton kernel:
+
+| metric | Triton (E2) | **FA-3 (E4)** |
+|--------|-------------|---------------|
+| Compute (SM) Throughput | 52.2 % | **76.2 %** |
+| DRAM Throughput | 3.0 % | 4.3 % |
+| Achieved Occupancy | 12.5 % | 14.0 % |
+
+Observation:
+- **Same low occupancy (~13 %) and same low DRAM (~4 %), but FA-3 hits 76 % SM vs Triton's 52 %.** That +24 pp is exactly the **warp-specialization** payoff: producer/consumer warpgroups keep the tensor cores fed (MMA overlaps softmax) without needing high occupancy. This *confirms Entry 3's diagnosis* — the bottleneck was compute overlap, not occupancy — and shows the fix that Triton's auto-WS couldn't provide but hand-crafted CUTLASS FA-3 does.
+- cuDNN on Hopper is the same FA-3 lineage, so parity is expected; we didn't beat it, we matched it.
+
+Conclusion: **Entry 4 (CUTLASS FA-3, 12.79 ms) is the new best — library-parity hand-instantiated FlashAttention-3.** The honest framing: we did *not* hand-write FA-3; we wired CUTLASS's FMHA collective (FmhaBuilder + cooperative WS/TMA dispatch) to our problem. That *is* the realistic "serious CUTLASS-FA3" — and it closes the entire gap (115 → 12.8 ms, matching the vendor library).
+
+Lessons: (1) The pragmatic way to "write FA-3" is to instantiate CUTLASS's FMHA collective, not hand-roll CuTe — `FmhaBuilder` + the right fusion/dispatch/tile is ~80 lines via load_inline. (2) ncu nails the mechanism: warp-specialization buys SM utilization (52→76 %) at the *same* occupancy — occupancy and utilization are different things. (3) Unlike swiglu (library was unbeatable), here matching the library by hand is achievable because the vendor kernel *is* open CUTLASS — reuse beats reinvention. (4) Reused everything from the swiglu CUTLASS work: load_inline build deps, sm90a flags, the spawned-worker stdout guard, stream handling.
