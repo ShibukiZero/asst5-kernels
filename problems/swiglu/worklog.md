@@ -115,3 +115,22 @@ Observation:
 - **concat GEMM failed correctness — but it's not a bug.** Debugging showed exactly **1 element / 67 M** exceeds tol (max abs diff 0.146 on outputs up to ~32 000). Cause: `check_implementation` compares against the reference's **two separate** TF32 GEMMs; concatenating into one GEMM makes cuBLAS pick a **different algorithm**, diverging the TF32 rounding on one near-zero output (diff 0.146 > atol 0.01). Mathematically correct, but it leaves the reference's exact numerical path. Also not faster than `compile` ⇒ dropped. **Lesson: a "correct" reformulation can trip a strict tolerance test if it changes the numerical path relative to the reference; keep the same GEMM structure as the reference.**
 
 Next step (Entry 3): hand-written **Triton fused matmul + epilogue**. Profiling refines the goal — the epilogue is already a single fused kernel, so the only remaining lever is the **two GEMMs (~96%)**: a fused kernel that computes `gate=x@W` and `value=x@V` in one pass (load each `x` tile once, feed both accumulators) and applies the epilogue inline (no `gate`/`value` write-back). High bar — must beat cuBLAS TF32 (already at 73% compute).
+
+---
+
+### Entry 3 — Hand-written Triton fused kernel — FAILED (3 ways)
+
+Date: 2026-06-25
+
+Thinking: one Triton kernel computing both `gate=x@W` and `value=x@V` per output tile (x tile loaded once → two accumulators), TF32 `tl.dot`, then `silu(gate+b)*(value+c)` in registers, single store — no gate/value to DRAM.
+
+Code version: `versions/v3_triton_fused.py` (block sizes env-tunable).
+
+Result — fails on three independent counts:
+1. **Speed: 11.1 ms** (only the 128×128×32 config runs) — **5.5× slower than Entry 2's 2.036 ms cuBLAS**, ~10% of TF32 peak. A naive Triton GEMM is nowhere near cuBLAS/CUTLASS.
+2. **Can't tune up: shared-memory OOM.** Fusing two GEMMs stages **W + V + x** tiles (× num_stages) in shared memory → every larger/better config (`BLOCK_K=64`, bigger tiles) fails `out of resource: shared memory`. Stuck at the slow config. (A real cost of the fusion.)
+3. **Correctness: fails the strict 1e-2 check.** The kernel is TF32-accurate (vs an FP64 ground truth it's as good as cuBLAS-TF32), but `check_implementation` compares to the reference's **cuBLAS-TF32** result; Triton's TF32 rounding differs, and the **nonlinear epilogue (silu·product) amplifies** the ~1.8e-3 median divergence past 1e-2 on ~5% of outputs. (Entry 1/2 passed only because their GEMMs *are* cuBLAS-TF32 → bit-identical to the reference.)
+
+Conclusion: **confirms the prediction** — a compute-bound dense GEMM is cuBLAS/CUTLASS territory; a hand-written Triton GEMM can't beat it, the SwiGLU fusion adds shared-memory pressure, and the strict test is effectively self-referential to cuBLAS's TF32 numerics. **Kept Entry 2 (torch.compile, 2.036 ms) as the SwiGLU best.**
+
+Lessons: (1) beating cuBLAS on GEMM by hand is extremely hard (CUTLASS-level effort). (2) Fusing two GEMMs doubles weight-tile staging → shared-memory-bound on tile size. (3) A custom GEMM's TF32 ≠ the library's TF32; a strict tolerance + nonlinear epilogue penalizes any GEMM that isn't the reference's. (4) The opposite of histogram: there hand-CUDA won (irregular); here the library wins (dense GEMM).
