@@ -128,3 +128,21 @@ Observation:
 - **But still ~2.3× over the per-stage roofline** (~1 ms: read field+u, write k+us ≈ 3.4 GB), and `_stage` only reaches **47 % DRAM** (not bandwidth-saturated). The remaining inefficiency: the **z-direction taps (z±1..4) are re-read ~9× across z-programs** (no reuse along z), plus 25-load latency / masking overhead. The x/y reuse is from L2; the z reuse is missing.
 
 Hypothesis / next (Entry 3, CUDA): **2.5D blocking** — a 2D (x,y) tile in shared memory, march along z keeping the 9 z-planes (z−4..z+4) in registers so **each plane is loaded from HBM once** (kills the z-redundancy), compute the in-plane taps from shared memory. Should push `_stage` from 2.33 ms toward ~1 ms → roughly halve total toward the ~21 ms roofline. Plus `-fmad` control for 1e-6.
+
+---
+
+### Entry 3 — Naive CUDA (correctness gate for the CUDA path) + fmad finding
+
+Date: 2026-06-27
+
+Thinking: before the complex 2.5D kernel, write the simplest CUDA (one thread per point, 25-tap Laplacian read from global/cache, 4 kernels/step like the Triton) to (a) **nail the 1e-6 / FMA question** and (b) get a CUDA baseline.
+
+Code version: `versions/v3_cuda_naive.py`. Scalars `ihx/S/dt` computed in **fp32 in C++** to match the reference's fp32 ops; coefficients as `float = double_literal` (rounds like PyTorch's scalar promotion).
+
+**Correctness gate — the key result:** passes 1e-6 with **both** `--fmad=true` and `--fmad=false` (max abs diff **4.77e-7 = ~1 fp32 ulp, identical for both**). So the FMA-contraction worry was **unfounded** for this problem — a straightforward CUDA fp32 implementation matches the reference within tolerance regardless of fmad. (Good to know; no need to fight the compiler.)
+
+Performance: **85.5 ms** (my timing) — **ties the Triton Entry 2 (88 ms)** and beats the README's naive CUDA (148 ms), because we fuse the 4 stages' combines + boundary-copy into the kernels (their "naive" likely doesn't).
+
+Observation: naive CUDA ≈ Triton because both read the 25 taps from global with L2 caching and neither reuses the z-direction — same ~2.3× over roofline, same ~47% DRAM. **No win over Entry 2 yet** (kept Triton as best). This is the baseline the 2.5D kernel must beat.
+
+Next (Entry 4): **2.5D blocking** — shared-memory (x,y) tile + register queue marching in z, so each plane is read once. Target: cut `_stage` toward ~1 ms / total toward the ~21 ms roofline.
