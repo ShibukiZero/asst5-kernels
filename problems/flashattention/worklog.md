@@ -104,6 +104,8 @@ Observation:
 - **SDPA (cuDNN) = 12.76 ms, 9× over baseline.** Achieves 8.8 TFLOP / 12.76 ms ≈ **690 TF/s (~70 % of FP16 peak)** — i.e. it's now **compute-bound and near the ~9 ms floor**, exactly as the roofline predicted once the S×S traffic is gone. Peak memory drops from 71 GB to a few GB (no S×S).
 - The default backend is **cuDNN**, which is ~2× faster than the bundled FA-2 "flash" backend (14 vs 24.6 ms) — on Hopper cuDNN is FA-3-class (wgmma + TMA + warp-specialization). The README's 28 ms was the FA-2 backend; cuDNN moved the bar much lower.
 
+Profiling (ncu): the cuDNN kernel is `cudnn_generated_fort_native_sdpa_sm90_flash_fprop_wgmma_f16_…` — **Compute(SM) 76.9 %, DRAM 4.4 %, L2 50 %**. Confirms it's an sm90 flash-attention wgmma kernel (FA-3 lineage), compute-bound, S×S traffic gone. Note: this **76.9 % SM matches our hand CUTLASS FA-3's 76.2 %** (Entry 4) — hardware-level parity, not just wall-clock.
+
 Hypothesis / next: a hand-written Triton FlashAttention (online softmax + tiling) is the learning goal. **Bar to beat: cuDNN's ~12.76 ms** (≈70 % MFU) — a high bar (same lesson as swiglu: the library is near-peak). Realistic aim: learn the algorithm and get within ~1.5–2× of cuDNN; matching/beating it would need FA-3-level Hopper engineering (CUTLASS/CuTe). Correctness regime is friendly (FP16, tol 1e-2, FP32 online-softmax accumulators are *more* accurate than the reference), unlike swiglu's TF32 self-reference trap.
 
 Next step (Entry 2): hand-written Triton FlashAttention; measure vs the 12.76 ms cuDNN bar.

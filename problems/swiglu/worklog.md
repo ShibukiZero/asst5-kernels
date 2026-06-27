@@ -131,6 +131,8 @@ Result — fails on three independent counts:
 2. **Can't tune up: shared-memory OOM.** Fusing two GEMMs stages **W + V + x** tiles (× num_stages) in shared memory → every larger/better config (`BLOCK_K=64`, bigger tiles) fails `out of resource: shared memory`. Stuck at the slow config. (A real cost of the fusion.)
 3. **Correctness: fails the strict 1e-2 check.** The kernel is TF32-accurate (vs an FP64 ground truth it's as good as cuBLAS-TF32), but `check_implementation` compares to the reference's **cuBLAS-TF32** result; Triton's TF32 rounding differs, and the **nonlinear epilogue (silu·product) amplifies** the ~1.8e-3 median divergence past 1e-2 on ~5% of outputs. (Entry 1/2 passed only because their GEMMs *are* cuBLAS-TF32 → bit-identical to the reference.)
 
+Profiling (ncu, `_swiglu_kernel`, the only config that runs, 128×128×32): **Compute(SM) 10.1 %, DRAM 10.7 %, Achieved Occupancy 6.25 %**, 13.66 ms — quantifies the "~10 % of TF32 peak": staging W+V+x tiles in shared memory limits it to ~1 block/SM (6 % occupancy), so the tensor cores are starved and it's nowhere near cuBLAS.
+
 Conclusion: **confirms the prediction** — a compute-bound dense GEMM is cuBLAS/CUTLASS territory; a hand-written Triton GEMM can't beat it, the SwiGLU fusion adds shared-memory pressure, and the strict test is effectively self-referential to cuBLAS's TF32 numerics. **Kept Entry 2 (torch.compile, 2.036 ms) as the SwiGLU best.**
 
 Lessons: (1) beating cuBLAS on GEMM by hand is extremely hard (CUTLASS-level effort). (2) Fusing two GEMMs doubles weight-tile staging → shared-memory-bound on tile size. (3) A custom GEMM's TF32 ≠ the library's TF32; a strict tolerance + nonlinear epilogue penalizes any GEMM that isn't the reference's. (4) The opposite of histogram: there hand-CUDA won (irregular); here the library wins (dense GEMM).
@@ -264,6 +266,8 @@ Performance — **no improvement**:
 | fused gate-GEMM-with-epilogue (alone) | 0.981 ms (plain gate was 0.735 ms) |
 | full pipeline (cuBLAS value 0.816 + fused gate 0.981) | **1.972 ms** |
 | Entry 5 (non-fused) | 1.954 ms |
+
+Profiling (ncu, the EVT fused gate kernel): **Compute(SM) 61.8 %, DRAM 32.4 %, L2 49.7 %**, 1.14 ms — vs the *plain* gate GEMM's 87 % SM (Entry 4). The EVT epilogue (aux `value` read + silu·mul) drags SM utilization down ~25 pp; the kernel now spends time on the memory-bound epilogue phase instead of pure MMA — the hard evidence behind the "wash".
 
 Why it's a wash (traffic analysis): the plain gate GEMM writes only `gate` (256 MB), already hidden (compute-bound). The fused gate GEMM instead **reads `value` (256 MB)** + writes `out` in its epilogue → +0.246 ms, which ≈ the standalone epilogue (0.253 ms) it eliminates. The "34 % DRAM headroom" is a **whole-kernel average dominated by the compute-bound mainloop**; the **epilogue *phase* is memory-bound**, so the extra value-read isn't hidden under mainloop compute. Fusion removed the already-cheap `gate` write but paid the full `value` read — net zero.
 
