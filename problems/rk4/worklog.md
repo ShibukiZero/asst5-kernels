@@ -59,3 +59,31 @@ Hypothesis:
 - **Correctness watch (1e-6):** fp32 rel-eps ~1e-7, tol 1e-6 leaves ~10× headroom. A custom kernel must keep the reference's op structure closely; nvcc's default `-fmad=true` (contract mul+add → single-rounding FMA) differs from PyTorch's separate mul/add and may break 1e-6 — test early, likely need `-fmad=false` or explicit `__fadd_rn/__fmul_rn`.
 
 Next step (Entry 1): `torch.compile` the reference; measure the fusion win and confirm 1e-6 still holds.
+
+---
+
+### Entry 1 — torch.compile (Inductor fuses the stencil + RK4)
+
+Date: 2026-06-27
+
+Thinking: the baseline's ~219 tiny kernels/step are pure launch+bandwidth waste. `torch.compile` should fuse the slice/add/mul chain into a few Triton kernels. The reference's in-place `copy_`/slice-assign/swap + `DeterministicContext` graph-break, so I rewrote a **functional per-step** version with math identical to the reference and compiled that.
+
+Code version: `versions/v1_compile.py` (= `submission.py`).
+
+Correctness: **pass** at 1e-6 — Inductor's fused fp32 codegen matches the eager reference within tolerance (the `-fmad`/reordering concern did NOT bite for Inductor here).
+
+Performance: **212.8 ms** (vs baseline 1408.5 ms = **6.6×**). Beats naive Triton (317 ms), approaches naive CUDA (148 ms).
+
+Profiling (torch.profiler, n_steps=2):
+
+| | baseline (E0) | torch.compile (E1) |
+|---|---|---|
+| kernels/step | ~219 | **~5 substantial** (+ ~9 tiny scalar) |
+| CUDA time/step | ~143 ms | ~21.8 ms |
+| dominant kernel | — | `triton_poi_fused_add_copy_mul_slice_1` 6.79 ms ×2/step |
+
+Observation:
+- **Inductor fused ~219 → ~5 kernels/step → 6.6×.** Big, cheap win.
+- **But it's still far from the ~21 ms roofline (we're at 218 ms).** The dominant fused kernel is **6.79 ms ≈ 22 GB of HBM traffic ≈ 25 field-reads** — i.e. the fused stencil computes all 25 taps in one kernel but reads each shifted slice **from global memory separately (no neighbor reuse)**. Inductor generates a pointwise kernel; it does not stage a tile+halo in shared memory. Plus it still materializes the per-stage `k`/`u_stage` intermediates.
+
+Hypothesis / next (Entry 2): hand-written **CUDA/Triton stencil with shared-memory halo reuse** — load each field tile + 4-cell halo **once** into shared memory, compute all 25 taps from SRAM (≈ 1 field-read instead of ~25), and fuse the RK4 stages to avoid materializing k1..k4. Should cut the dominant kernel ~10–25× toward the roofline. Correctness: must hold 1e-6 — replicate the reference's op order and test `-fmad=false` vs default early (Inductor passed, but a hand CUDA kernel with default FMA might not).
