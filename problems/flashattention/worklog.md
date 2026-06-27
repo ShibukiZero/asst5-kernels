@@ -258,6 +258,17 @@ Results:
 | coop / pingpong 128×256 + accQK=fp16 | FAIL init (same constraint for D=128 on this shape) |
 | cooperative 128×128 + persistent scheduler | 16.67 ms (worse) |
 
-Conclusion: **nothing beat cooperative 128×128; kept Entry 4 (12.79 ms).** Pingpong looked marginally faster in a quick `perf_counter` loop (14.18 vs coop 14.36) but the **authoritative harness** (with `clear_l2_cache` + 100 runs) exposed it as *worse* and high-variance (14.64 ms mean). The 128×256 tiles can't initialize for D=128 on this problem (register/shmem limit). cuDNN parity (12.79 ms, ~58 % MFU) stands as the ceiling — we match the vendor, we don't beat it.
+Profiling (ncu, large) — pingpong vs the Entry-4 cooperative kernel:
+
+| metric | cooperative (E4) | pingpong (E5) |
+|--------|------------------|---------------|
+| Compute (SM) | 76.2 % | 76.2 % |
+| DRAM | 4.3 % | 4.3 % |
+| Achieved Occupancy | 14.0 % | 14.0 % |
+| ncu duration (replay) | 14.99 ms | 14.83 ms |
+
+⇒ **the two are identical in steady-state ncu SoL** (same 76 % SM). Yet pingpong's end-to-end harness time is worse and high-variance (14.64 ms mean, std 0.93) vs cooperative's stable 12.79 ms. So the regression is **not per-kernel compute efficiency** — it's scheduling/launch behavior across the 256·(S/128) tiles (pingpong's two alternating math warpgroups are more sensitive to L2 state / wave quantization under `clear_l2_cache`). A single-kernel ncu profile *cannot* see this; only the full benchmark does.
+
+Conclusion: **nothing beat cooperative 128×128; kept Entry 4 (12.79 ms).** Pingpong looked marginally faster in a quick `perf_counter` loop (14.18 vs coop 14.36) and has identical ncu SoL, but the **authoritative harness** (with `clear_l2_cache` + 100 runs) exposed it as *worse* and high-variance (14.64 ms mean). The 128×256 tiles can't initialize for D=128 on this problem (register/shmem limit). cuDNN parity (12.79 ms, ~58 % MFU) stands as the ceiling — we match the vendor, we don't beat it.
 
 Lessons: (1) **Trust the harness measurement, not quick loops** — without `clear_l2_cache` + enough iters, pingpong looked best but was actually worse + noisy. (2) cuDNN's default config (cooperative-ish) is already optimal for this shape; the easy knobs don't beat it. (3) Beating cuDNN would need something cuDNN doesn't do for fp16 (e.g. FP8 — but that fails the fp16 1e-2 tolerance) — diminishing returns; matched is the right place to stop.
