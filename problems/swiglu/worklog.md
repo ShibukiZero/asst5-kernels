@@ -83,3 +83,26 @@ Observation:
 - New balance: with TF32 the two GEMMs drop to ~1.5 ms, so the **unfused elementwise epilogue (~1.3 ms) is now ~44% of runtime** — the next target. The two GEMMs are also still separate launches over the same `x`.
 
 Next step: fuse — (a) the epilogue (bias + swish + multiply) into one pass instead of ~5 elementwise kernels materializing `gate`/`value`; (b) the two GEMMs into one `x @ [W|V]`. Consider a Triton fused matmul+epilogue (Triton's sweet spot).
+
+---
+
+### Entry 2 — PyTorch-level fusion (TF32 + SiLU + torch.compile)
+
+Date: 2026-06-25
+
+Thinking: after TF32, the two GEMMs are ~1.5 ms and the unfused elementwise epilogue (~1.3 ms) dominates the rest. Fuse it at the PyTorch level: (a) `F.silu` (β=1 ⇒ swish == silu) collapses sigmoid+multiply into one kernel; (b) `torch.compile` lets Inductor auto-fuse the whole epilogue; (c) fuse the two GEMMs into `x @ [W|V]`.
+
+Results (all TF32):
+
+| Variant | Correctness | Runtime | vs Entry 1 (2.94 ms) |
+|---------|-------------|---------|----------------------|
+| `F.silu` (fused swish, separate GEMMs) | pass | 2.53 ms | 1.16× |
+| **`torch.compile`** (Inductor fuses epilogue) | pass | **2.036 ms** | **1.45×** |
+| concat GEMM `x @ [W\|V]` | **FAIL** | — | dropped |
+
+Observation:
+- `F.silu` alone: 2.94→2.53 ms (one fused kernel instead of sigmoid + multiply).
+- **`torch.compile` is the best PyTorch-level result, 2.036 ms (~6× over baseline)** — Inductor fuses the bias/silu/multiply epilogue (auto-generated Triton), removing the `gate`/`value` materialization.
+- **concat GEMM failed correctness — but it's not a bug.** Debugging showed exactly **1 element / 67 M** exceeds tol (max abs diff 0.146 on outputs up to ~32 000). Cause: `check_implementation` compares against the reference's **two separate** TF32 GEMMs; concatenating into one GEMM makes cuBLAS pick a **different algorithm**, diverging the TF32 rounding on one near-zero output (diff 0.146 > atol 0.01). Mathematically correct, but it leaves the reference's exact numerical path. Also not faster than `compile` ⇒ dropped. **Lesson: a "correct" reformulation can trip a strict tolerance test if it changes the numerical path relative to the reference; keep the same GEMM structure as the reference.**
+
+Next step (Entry 3): hand-written **Triton fused matmul + epilogue** — the real kernel exercise; may beat `torch.compile` and avoids relying on Inductor.
