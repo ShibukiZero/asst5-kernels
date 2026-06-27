@@ -107,3 +107,56 @@ Observation:
 Hypothesis / next: a hand-written Triton FlashAttention (online softmax + tiling) is the learning goal. **Bar to beat: cuDNN's ~12.76 ms** (≈70 % MFU) — a high bar (same lesson as swiglu: the library is near-peak). Realistic aim: learn the algorithm and get within ~1.5–2× of cuDNN; matching/beating it would need FA-3-level Hopper engineering (CUTLASS/CuTe). Correctness regime is friendly (FP16, tol 1e-2, FP32 online-softmax accumulators are *more* accurate than the reference), unlike swiglu's TF32 self-reference trap.
 
 Next step (Entry 2): hand-written Triton FlashAttention; measure vs the 12.76 ms cuDNN bar.
+
+---
+
+### Entry 2 — Hand-written Triton FlashAttention (FA-2 style)
+
+Date: 2026-06-27
+
+Thinking: implement real flash attention — tile Q (BLOCK_M rows) × K/V (BLOCK_N cols), keep the running softmax stats `m` (row max) and `l` (exp-sum) per query row, never materialize S×S. Standard FA-2 tricks: fold `sm_scale·log2(e)` into Q and use `exp2` (HW instruction); rescale the accumulator by `α = exp2(m_old − m_new)` each K/V block. No boundary mask (all benchmark seq_lens are multiples of 128).
+
+Code version: `versions/v2_triton.py` (= `submission.py`).
+
+Correctness: **pass** all 3 cases (small max abs diff 0.001 — FP32 online-softmax accumulators, well within 1e-2).
+
+Tile-size sweep (large case, correctness checked on small):
+
+| (BLOCK_M, BLOCK_N, warps, stages) | time |
+|-----------------------------------|------|
+| **(128, 128, 8, 3)** | **18.28 ms** ✅ best |
+| (64, 64, 4, 3) | 19.61 |
+| (128, 64, 8, 4) | 20.45 |
+| (128, 64, 8, 3) | 20.58 |
+| (64, 128, 4, 3) | 21.84 |
+| (128, 128, 4, 3) | 26.13 |
+| (128, 32, 4, 4) | 25.57 |
+| (64, 64, 8, 3) | 37.49 |
+| (128, 128, 8, 4) | OOM (shmem 294 KB > 228 KB) |
+
+Best config harness numbers:
+
+| case | Triton | vs baseline | vs cuDNN (E1) |
+|------|--------|-------------|---------------|
+| small | 0.094 ms | 3.7× | (cuDNN 0.063) |
+| medium | 2.247 ms | 5.6× | (cuDNN 1.632) |
+| **large** | **18.86 ms** (best 17.07) | **6.1×** | 1.48× slower (cuDNN 12.76) |
+
+Profiling (ncu, best config, large; ncu duration replay-inflated to 21.4 ms vs real 18.9):
+
+| metric | value |
+|--------|-------|
+| **DRAM Throughput** | **3.0 %** |
+| Compute (SM) Throughput | 52.2 % |
+| Memory Throughput | 37.4 % |
+| Achieved Occupancy | 12.5 % (theoretical 12.5 %, **register-limited**) |
+| top warp stall | waiting at CTA barrier (sibling warps) |
+
+Observation:
+- **The flash-attention win is real and confirmed by ncu: DRAM is only 3 %** (vs the baseline which was memory-bound at ~2.5 TB/s streaming the 34 GB S×S). The O(N²) memory wall is gone; the kernel is now compute-bound. Peak memory ~few GB (no S×S).
+- **18.86 ms ≈ 467 TF/s ≈ 47 % MFU.** It beats the baseline 6.1× and **beats PyTorch's own FA-2 "flash" backend (24.6 ms)**, but loses to **cuDNN (12.76 ms, ~70 % MFU)** by 1.48×.
+- **Why the gap to cuDNN:** SM throughput is only 52 % and occupancy 12.5 %, **limited by registers** (the `[128,128]` FP32 accumulator + Q tile). cuDNN on Hopper is FA-3-class — **warp-specialized** (separate producer/consumer warpgroups), **TMA** async loads, and software-pipelined MMA/softmax — which keep the tensor cores fed at ~70 %. Our single-program Triton kernel can't express that scheduling, so it stalls at barriers and under-occupies.
+
+Hypothesis / next: the gap is compute-scheduling, not memory. Levers that *might* close some of it (diminishing returns): smaller `BLOCK_M` to cut register pressure / raise occupancy; `tl.dot` with FP8 (accuracy risk); Triton's newer warp-specialization / TMA pipelining (`tl.async`); or a `triton.autotune` over a wider grid. Matching cuDNN would essentially mean re-implementing FA-3 (CUTLASS/CuTe) — a large undertaking. **Conclusion: kept Triton (18.86 ms) as the hand-written best; it's the real learning artifact (correct flash attention, memory wall eliminated), within ~1.5× of FA-3-class cuDNN.**
+
+Lessons: (1) Flash attention's value is **IO**, and ncu proves it — DRAM 3 % vs a memory-bound baseline; the whole 115→19 ms win is from not touching S×S. (2) Hand-Triton flash is genuinely good (beats FA-2 backend) — FA is Triton's sweet spot — but the last ~1.5× to FA-3/cuDNN needs Hopper warp-specialization/TMA that Triton doesn't fully expose. (3) Online softmax with FP32 accumulators is *more* accurate than the FP16 reference → correctness is easy here (unlike swiglu's TF32 trap). (4) Best tile was the largest that fits shmem (128×128); pushing num_stages to 4 OOMs shared memory — the classic flash-attention occupancy/shmem tension.
