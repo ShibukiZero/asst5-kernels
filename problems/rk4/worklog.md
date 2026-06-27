@@ -49,6 +49,7 @@ Profiling (torch.profiler, n_steps=2; steps are identical):
 | CUDA kernel launches | **~219 per step** (438 in 2 steps; ~2190 for the full run) |
 | CUDA time | 286 ms / 2 steps → ~143 ms/step (×10 = 1430 ≈ baseline) |
 | kernel types | all `(vectorized_)elementwise_kernel` (~500–790 µs each) + 17 DtoD memcpy/2 steps |
+| ncu (one elementwise) | **DRAM 92.4 %**, L2 82.8 %, Compute 4.9 % — pure DRAM-bandwidth-bound |
 
 Observation — what limits performance:
 - **The baseline does ~219 separate, memory-bound kernel passes per step.** Every stencil term and every RK4 combine is its own kernel that streams the full ~0.86 GB field through HBM (each ~0.5–0.8 ms = one read+write of the field). No data reuse across the 25-point stencil — each `c_i·(u_shift_a + u_shift_b)` reads the field twice and writes a 0.86 GB temporary.
@@ -81,9 +82,11 @@ Profiling (torch.profiler, n_steps=2):
 | kernels/step | ~219 | **~5 substantial** (+ ~9 tiny scalar) |
 | CUDA time/step | ~143 ms | ~21.8 ms |
 | dominant kernel | — | `triton_poi_fused_add_copy_mul_slice_1` 6.79 ms ×2/step |
+| ncu (dominant kernel) | — | DRAM 14 %, L2 41 %, SM 49 %, **occupancy 23 %** — occupancy/latency-limited, nothing saturated |
 
 Observation:
 - **Inductor fused ~219 → ~5 kernels/step → 6.6×.** Big, cheap win.
+- **ncu shows the dominant Inductor kernel is occupancy-limited (23 %), not bandwidth-bound** (DRAM 14 %, L2 41 %, SM 49 %) — it under-utilizes everything. This is *why* torch.compile (213 ms) later loses to the hand Triton/CUDA (~85 ms), which reach 80 % occupancy / 90 % L2.
 - **But it's still far from the ~21 ms roofline (we're at 218 ms).** The dominant fused kernel is **6.79 ms ≈ 22 GB of HBM traffic ≈ 25 field-reads** — i.e. the fused stencil computes all 25 taps in one kernel but reads each shifted slice **from global memory separately (no neighbor reuse)**. Inductor generates a pointwise kernel; it does not stage a tile+halo in shared memory. Plus it still materializes the per-stage `k`/`u_stage` intermediates.
 
 Hypothesis / next (Entry 2): hand-written **CUDA/Triton stencil with shared-memory halo reuse** — load each field tile + 4-cell halo **once** into shared memory, compute all 25 taps from SRAM (≈ 1 field-read instead of ~25), and fuse the RK4 stages to avoid materializing k1..k4. Should cut the dominant kernel ~10–25× toward the roofline. Correctness: must hold 1e-6 — replicate the reference's op order and test `-fmad=false` vs default early (Inductor passed, but a hand CUDA kernel with default FMA might not).
