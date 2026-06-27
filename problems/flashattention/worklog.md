@@ -160,3 +160,36 @@ Observation:
 Hypothesis / next: the gap is compute-scheduling, not memory. Levers that *might* close some of it (diminishing returns): smaller `BLOCK_M` to cut register pressure / raise occupancy; `tl.dot` with FP8 (accuracy risk); Triton's newer warp-specialization / TMA pipelining (`tl.async`); or a `triton.autotune` over a wider grid. Matching cuDNN would essentially mean re-implementing FA-3 (CUTLASS/CuTe) — a large undertaking. **Conclusion: kept Triton (18.86 ms) as the hand-written best; it's the real learning artifact (correct flash attention, memory wall eliminated), within ~1.5× of FA-3-class cuDNN.**
 
 Lessons: (1) Flash attention's value is **IO**, and ncu proves it — DRAM 3 % vs a memory-bound baseline; the whole 115→19 ms win is from not touching S×S. (2) Hand-Triton flash is genuinely good (beats FA-2 backend) — FA is Triton's sweet spot — but the last ~1.5× to FA-3/cuDNN needs Hopper warp-specialization/TMA that Triton doesn't fully expose. (3) Online softmax with FP32 accumulators is *more* accurate than the FP16 reference → correctness is easy here (unlike swiglu's TF32 trap). (4) Best tile was the largest that fits shmem (128×128); pushing num_stages to 4 OOMs shared memory — the classic flash-attention occupancy/shmem tension.
+
+---
+
+### Entry 3 — Trying to close the gap to cuDNN (warp-spec + occupancy tuning) — NO GAIN
+
+Date: 2026-06-27
+
+Thinking: Entry 2's ncu said the kernel is compute-bound at only 52 % SM, occupancy 12.5 % (register-limited), stalling at CTA barriers — i.e. MMA (tensor cores) and softmax (CUDA cores) don't overlap. The textbook fix is FA-3-style **warp specialization** (producer/consumer warpgroups ping-pong MMA ↔ softmax). Triton 3.7.1 exposes this as a one-line loop hint `tl.range(..., warp_specialize=True)`, plus occupancy knobs (`num_warps`, `maxnreg`). Try them.
+
+Code version: experiments in `versions/v2_triton.py` parameter space (not a new submission; nothing beat Entry 2).
+
+Results (large case, best tile BLOCK_M=BLOCK_N=128 unless noted; cuDNN bar = 12.76 ms, Entry-2 Triton = 18.0 ms):
+
+| change | time | verdict |
+|--------|------|---------|
+| `warp_specialize=True` (8 warps, 3 stages) | 18.1 ms | **no change** vs 18.0 |
+| `warp_specialize=True` + 4 warps | compile FAIL | `NVGPUWarpSpecialization` MLIR pass fails |
+| `warp_specialize=True` + num_stages=4 | OOM shmem | 294 KB > 228 KB |
+| num_warps=16 | 36.8 ms | much worse (warp contention) |
+| num_warps=16, stages=2 | 37.9 ms | worse |
+| maxnreg=128 | 203.7 ms | catastrophic register spill |
+| maxnreg=160 | 22.8 ms | worse (spill) |
+| maxnreg=192 | 19.0 ms | worse |
+| maxnreg=224 | 18.3 ms | ≈ no cap, no gain |
+| BLOCK_M=128, BLOCK_N=256 | OOM shmem | — |
+
+Observation:
+- **Nothing beat 18 ms.** `warp_specialize=True` compiled (for 8 warps) but gave **zero speedup** — Triton's automatic WS pass does not reproduce FA-3's hand-crafted MMA↔softmax overlap for this kernel (and it can't even compile at 4 warps).
+- **Every occupancy-raising knob made it slower**: more warps → contention; `maxnreg` caps → register spills (the `[128,128]` FP32 accumulator genuinely needs the registers). This *confirms* occupancy is **not** the lever — consistent with Entry 2's BLOCK_M=64 sweep also being slower. The real bottleneck is the lack of compute overlap, which these knobs can't fix.
+
+Conclusion: **~18 ms is the ceiling for this (standard) Triton flash-attention formulation; kept Entry 2 (18.86 ms) as the hand-written best.** The remaining 1.48× to cuDNN is FA-3-level Hopper scheduling (warp-specialized producer/consumer + TMA + software-pipelined MMA/softmax). Triton's automatic `warp_specialize` doesn't deliver it; closing the gap would require either a deep TMA + manual-pipeline Triton rewrite (uncertain — the one untried lever, but DRAM is only 3 % so loads aren't the bottleneck) or hand-written **CUTLASS/CuTe FA-3** (very large effort). Not pursued — diminishing returns, same lesson as swiglu (the vendor library is near-peak; hand-written gets close but the last ~1.5× needs vendor-level engineering).
+
+Lessons: (1) `warp_specialize=True` is a cheap one-liner to *try*, but auto-WS ≠ hand-crafted FA-3 WS — don't expect the FA-3 speedup for free. (2) When ncu says "occupancy-limited," verify by *raising* occupancy — here every attempt was slower, proving the diagnosis (occupancy) was a symptom, not the cause (compute overlap). (3) Record the dead ends: WS, num_warps, maxnreg all explored and rejected with numbers.
