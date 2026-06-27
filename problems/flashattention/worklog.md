@@ -239,3 +239,25 @@ Observation:
 Conclusion: **Entry 4 (CUTLASS FA-3, 12.79 ms) is the new best — library-parity hand-instantiated FlashAttention-3.** The honest framing: we did *not* hand-write FA-3; we wired CUTLASS's FMHA collective (FmhaBuilder + cooperative WS/TMA dispatch) to our problem. That *is* the realistic "serious CUTLASS-FA3" — and it closes the entire gap (115 → 12.8 ms, matching the vendor library).
 
 Lessons: (1) The pragmatic way to "write FA-3" is to instantiate CUTLASS's FMHA collective, not hand-roll CuTe — `FmhaBuilder` + the right fusion/dispatch/tile is ~80 lines via load_inline. (2) ncu nails the mechanism: warp-specialization buys SM utilization (52→76 %) at the *same* occupancy — occupancy and utilization are different things. (3) Unlike swiglu (library was unbeatable), here matching the library by hand is achievable because the vendor kernel *is* open CUTLASS — reuse beats reinvention. (4) Reused everything from the swiglu CUTLASS work: load_inline build deps, sm90a flags, the spawned-worker stdout guard, stream handling.
+
+---
+
+### Entry 5 — Trying to BEAT cuDNN: FMHA config sweep (schedule / tile / scheduler / accQK) — no improvement
+
+Date: 2026-06-27
+
+Thinking: Entry 4 matched cuDNN (12.79 vs 12.76). cuDNN's heuristic might not pick the optimal config for our exact shape (non-causal, S=8192, D=128, fp16), so sweep the CUTLASS FMHA knobs: schedule (cooperative vs **pingpong**), TileShape (128×128 vs **128×256**), TileScheduler (individual vs **persistent**), and **accQK=fp16**.
+
+Results:
+
+| config | result |
+|--------|--------|
+| cooperative 128×128 (Entry 4) | **12.79 ms** (harness, stable) |
+| pingpong 128×128 | quick-loop 14.18 ms (looked best!) → **harness 14.64 ms mean, std 0.93, worst 17.1** — worse + high-variance |
+| coop 128×256 (fp32 acc) | FAIL init (`C7511` wgmma serialized — insufficient registers) |
+| coop / pingpong 128×256 + accQK=fp16 | FAIL init (same constraint for D=128 on this shape) |
+| cooperative 128×128 + persistent scheduler | 16.67 ms (worse) |
+
+Conclusion: **nothing beat cooperative 128×128; kept Entry 4 (12.79 ms).** Pingpong looked marginally faster in a quick `perf_counter` loop (14.18 vs coop 14.36) but the **authoritative harness** (with `clear_l2_cache` + 100 runs) exposed it as *worse* and high-variance (14.64 ms mean). The 128×256 tiles can't initialize for D=128 on this problem (register/shmem limit). cuDNN parity (12.79 ms, ~58 % MFU) stands as the ceiling — we match the vendor, we don't beat it.
+
+Lessons: (1) **Trust the harness measurement, not quick loops** — without `clear_l2_cache` + enough iters, pingpong looked best but was actually worse + noisy. (2) cuDNN's default config (cooperative-ish) is already optimal for this shape; the easy knobs don't beat it. (3) Beating cuDNN would need something cuDNN doesn't do for fp16 (e.g. FP8 — but that fails the fp16 1e-2 tolerance) — diminishing returns; matched is the right place to stop.
