@@ -143,7 +143,18 @@ Code version: `versions/v3_cuda_naive.py`. Scalars `ihx/S/dt` computed in **fp32
 
 Performance: **85.5 ms** (my timing) — **ties the Triton Entry 2 (88 ms)** and beats the README's naive CUDA (148 ms), because we fuse the 4 stages' combines + boundary-copy into the kernels (their "naive" likely doesn't).
 
-Observation: naive CUDA ≈ Triton because both read the 25 taps from global with L2 caching and neither reuses the z-direction — same ~2.3× over roofline, same ~47% DRAM. **No win over Entry 2 yet** (kept Triton as best). This is the baseline the 2.5D kernel must beat.
+Profiling (ncu, `stage_k`, large):
+
+| metric | value |
+|--------|-------|
+| **L2 Cache Throughput** | **90.4 %** (the limiter) |
+| Memory Throughput | 90.4 % |
+| DRAM Throughput | 50.1 % |
+| Compute (SM) | 66.3 % |
+| Achieved Occupancy | 80.2 % |
+| Duration | 2.13 ms |
+
+Observation: naive CUDA ≈ Triton (~85–88 ms), and ncu shows it is **L2-bandwidth-bound (90.4 % L2 throughput)**, *not* DRAM-bound (50 %) or compute-bound (66 %), at a healthy 80 % occupancy. **The 25 neighbor reads are served by L2 at ~90 % saturation — L2 is doing the stencil reuse.** (My earlier "~47 % DRAM" guess was wrong; the real picture is L2-limited.) This both explains why naive is fast *and* foreshadows Entry 4: since L2 already provides near-saturated reuse, manually moving reuse to shared memory can't help (and adds halo + barrier overhead). **No win over Entry 2 yet** (kept Triton/naive as best). To go faster one must cut L2 traffic (e.g. vectorized/coalesced loads), not add manual tiling.
 
 Next (Entry 4): **2.5D blocking** — shared-memory (x,y) tile + register queue marching in z, so each plane is read once. Target: cut `_stage` toward ~1 ms / total toward the ~21 ms roofline.
 
