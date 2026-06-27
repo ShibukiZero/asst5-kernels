@@ -77,6 +77,10 @@ Results:
 | **tf32** | **pass** | **2.94 ms** | **4.1×** |
 | bf16 | **FAIL** | — | exceeds tolerance |
 
+Profiler stats (TF32 path):
+- GEMMs: `sm90_xmma_gemm_f32f32_**tf32f32**_f32 … warpgroupsize … cublas` — **TF32 Tensor Cores (Hopper wgmma)**, **977 µs each** (baseline FP32 was 6.71 ms → **6.9×**), Compute 73% / DRAM 28%. The two GEMMs (~1.95 ms) are now the dominant cost.
+- Epilogue: elementwise kernels ~227 µs each, DRAM ~68% (memory-bound, **still unfused**).
+
 Observation:
 - **TF32 Tensor Cores: 4.1× and correct.** TF32 keeps ~10 mantissa bits (rel err ~1e-3) → comfortably within rtol=1e-2.
 - **BF16 fails correctness.** 8 mantissa bits (~4e-3/elem) accumulated over K=2048 pushes the result past 1e-2. (Could be rescued with bf16×3 / error correction, but not worth it — TF32 is the sweet spot.)
@@ -100,9 +104,14 @@ Results (all TF32):
 | **`torch.compile`** (Inductor fuses epilogue) | pass | **2.036 ms** | **1.45×** |
 | concat GEMM `x @ [W\|V]` | **FAIL** | — | dropped |
 
+Profiler stats (torch.compile):
+- GEMMs: the same two TF32 cuBLAS kernels (977 / 983 µs) — Inductor keeps cuBLAS for the matmuls.
+- Epilogue: collapsed into **one** Inductor-generated Triton kernel `triton_poi_fused__unsafe_view_add_mul_silu_0`, **256 µs**, DRAM 91.6% (memory-bound). The ~5 separate elementwise kernels are gone.
+- ⇒ **2.036 ms ≈ 1.95 ms (two GEMMs, ~96%) + 0.26 ms (fused epilogue).** The epilogue is now essentially solved; the two TF32 GEMMs are the remaining ~96%.
+
 Observation:
 - `F.silu` alone: 2.94→2.53 ms (one fused kernel instead of sigmoid + multiply).
 - **`torch.compile` is the best PyTorch-level result, 2.036 ms (~6× over baseline)** — Inductor fuses the bias/silu/multiply epilogue (auto-generated Triton), removing the `gate`/`value` materialization.
 - **concat GEMM failed correctness — but it's not a bug.** Debugging showed exactly **1 element / 67 M** exceeds tol (max abs diff 0.146 on outputs up to ~32 000). Cause: `check_implementation` compares against the reference's **two separate** TF32 GEMMs; concatenating into one GEMM makes cuBLAS pick a **different algorithm**, diverging the TF32 rounding on one near-zero output (diff 0.146 > atol 0.01). Mathematically correct, but it leaves the reference's exact numerical path. Also not faster than `compile` ⇒ dropped. **Lesson: a "correct" reformulation can trip a strict tolerance test if it changes the numerical path relative to the reference; keep the same GEMM structure as the reference.**
 
-Next step (Entry 3): hand-written **Triton fused matmul + epilogue** — the real kernel exercise; may beat `torch.compile` and avoids relying on Inductor.
+Next step (Entry 3): hand-written **Triton fused matmul + epilogue**. Profiling refines the goal — the epilogue is already a single fused kernel, so the only remaining lever is the **two GEMMs (~96%)**: a fused kernel that computes `gate=x@W` and `value=x@V` in one pass (load each `x` tile once, feed both accumulators) and applies the epilogue inline (no `gate`/`value` write-back). High bar — must beat cuBLAS TF32 (already at 73% compute).
