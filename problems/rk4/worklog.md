@@ -192,3 +192,34 @@ Observation — why the textbook technique LOST:
 Conclusion: **kept naive CUDA / Triton (~85–88 ms) as best.** This is a genuine modern-GPU lesson — the classic shared-memory 2.5D stencil blocking (a win on older small-cache GPUs) can *lose* to a naive massively-parallel kernel on a large-L2 GPU, because L2 already provides the reuse and the explicit tiling only adds halo redundancy + barrier overhead. (Echoes Entry 2's finding that occupancy/parallelism, not manual reuse, was the lever.)
 
 Lessons: (1) Don't assume the textbook optimization wins — measure. 2.5D blocking was the "obvious" answer and it was 1.6–1.8× *slower*. (2) On big-L2 GPUs, a naive massively-parallel stencil is hard to beat; manual shared-mem tiling fights the cache rather than helping it. (3) ncu's occupancy + DRAM% immediately showed the 2.5D was starved (12.5 % occ, <1 % DRAM), not reuse-limited.
+
+---
+
+### Entry 5 — CUDA x-register-coarsening (relieve the L2 bottleneck) — SLOWER, kept naive
+
+Date: 2026-06-27
+
+Thinking: Entry 3's ncu showed naive is **L2-bandwidth-bound (90 % L2, 50 % DRAM)** — i.e. the 25 loads/point × 216M points flood L2. DRAM at 50 % implies ~2× theoretical headroom *if* L2 traffic can be cut. Lever: each thread computes **CO consecutive x** and loads the contiguous x-run (CO+8 values) **once into registers**, reusing it for all CO outputs' x-derivative (x-direction loads 9/pt → ~3/pt). No shared memory, no barriers — should keep occupancy.
+
+Code version: `versions/v5_cuda_coarsen.py`. Sweep over (BX, BY, CO).
+
+Correctness: **pass at 1e-6** (4.77e-7, all configs).
+
+Performance — **SLOWER, again**:
+
+| (BX,BY,CO) | time |
+|------------|------|
+| naive (E3) | **85 ms** |
+| (64,8,4) | 145 ms |
+| (32,8,4) | 172 ms |
+| (64,4,4) | 177 ms |
+| (64,4,8) | 340 ms |
+| (32,4,8) | 377 ms |
+
+Profiling (ncu, coarsened (64,8,4) march): occupancy **65.8 %** (down from naive's 80 %), and **DRAM 6.6 %, L2 58 %, SM 40 %, Memory 64 % — nothing saturated.** The kernel went **latency-bound**: 4× work/thread + the `r[CO+8]` register array cut the thread count and raised register pressure → too few warps in flight to hide memory latency → every unit idle → slower, even though L2 *traffic* dropped (L2 90 %→58 %, DRAM 50 %→7 %).
+
+Conclusion: **kept naive CUDA (85 ms) as the practical optimum.** This is the third traffic-reduction technique to lose (concat already n/a; 2.5D shared-mem; x-coarsening registers). The pattern is conclusive: **this stencil is memory-*latency*-bound at the kernel level, and it needs the naive kernel's ~216M-thread parallelism to hide that latency. Every technique that cuts threads to reduce L2/DRAM traffic starves the pipeline and loses more than it saves.** The L2-90 % "wall" is therefore *not* relievable on this access pattern — the DRAM-50 % headroom is real in theory but unreachable, because reaching it requires fewer memory ops per thread, which means fewer threads, which means latency-bound.
+
+Answer to "what's the bottleneck": **L2 bandwidth (90 %)** for the naive — but it's a *balanced* L2-bound-at-high-occupancy kernel. The only way to cut L2 traffic (block/register reuse) sacrifices the parallelism that hides latency, so naive is the sweet spot. **~85 ms (16.6× over baseline) stands as the best.**
+
+Lessons: (1) "Theoretical headroom" (DRAM 50 %) ≠ reachable — the techniques to claim it have side effects (parallelism loss) that dominate. (2) For a latency-bound memory kernel, **occupancy/parallelism is the currency**; trading it for locality is a net loss on a big-L2 GPU. (3) Three independent optimizations (2.5D, coarsening, and earlier the Triton tile sweep) all converged on the same conclusion — naive massive parallelism wins. Knowing when to stop optimizing is itself the result.
