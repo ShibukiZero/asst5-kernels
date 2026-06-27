@@ -87,3 +87,44 @@ Observation:
 - **But it's still far from the ~21 ms roofline (we're at 218 ms).** The dominant fused kernel is **6.79 ms ≈ 22 GB of HBM traffic ≈ 25 field-reads** — i.e. the fused stencil computes all 25 taps in one kernel but reads each shifted slice **from global memory separately (no neighbor reuse)**. Inductor generates a pointwise kernel; it does not stage a tile+halo in shared memory. Plus it still materializes the per-stage `k`/`u_stage` intermediates.
 
 Hypothesis / next (Entry 2): hand-written **CUDA/Triton stencil with shared-memory halo reuse** — load each field tile + 4-cell halo **once** into shared memory, compute all 25 taps from SRAM (≈ 1 field-read instead of ~25), and fuse the RK4 stages to avoid materializing k1..k4. Should cut the dominant kernel ~10–25× toward the roofline. Correctness: must hold 1e-6 — replicate the reference's op order and test `-fmad=false` vs default early (Inductor passed, but a hand CUDA kernel with default FMA might not).
+
+---
+
+### Entry 2 — Hand-written Triton fused stencil + RK4
+
+Date: 2026-06-27
+
+Thinking: beat Inductor (which already generates Triton) by (a) cutting to **4 kernels/step** — 3 stage + 1 final, each fusing the 25-tap Laplacian + the stage combine + boundary-copy into one pass — and (b) getting neighbor reuse. (Plan was to go straight to CUDA; doing Triton first as a stepping stone + tile-strategy study.) RK4 stages have cross-tile halo dependencies, so they *must* be separate kernel launches (4/step); within each, the lap reuse comes from the **L2 cache** on the shifted `tl.load`s (Triton's block model can't cleanly express a 3D tile+halo in shared memory — that's the CUDA job for Entry 3).
+
+Code version: `versions/v2_triton.py` (= `submission.py`). 25 taps as masked `tl.load`s at `base ± d`, `± d·Nx`, `± d·Ny·Nx`; module constants as `tl.constexpr`; one z-plane per program, 2D (y,x) tile.
+
+Correctness: **pass at 1e-6** (max abs diff 4.77e-7 on 64³/3-steps) — Triton's fp32 codegen is within tol, same as Inductor.
+
+Tile-strategy sweep (grid 600, 10 steps):
+
+| (BLOCK_X, BLOCK_Y, warps) | time |
+|---------------------------|------|
+| **(128, 4, 4)** | **87.9 ms** ✅ best |
+| (64, 4, 4) | 89.1 |
+| (64, 8, 8) | 89.9 |
+| (32, 8, 4) | 101.2 |
+| (32, 32, 8) | 111.8 |
+| (16, 16, 4) | 135.8 |
+
+Best = **wide contiguous-x tile (BX=128), thin y (BY=4), 4 warps** — wide x maximizes coalescing and L2 reuse of the x-direction taps (±1..4 share cache lines); thin y keeps the working set small.
+
+Performance (harness): **88.0 ms** — vs baseline 1408 (**16×**), vs torch.compile 212.8 (**2.4×**), vs naive CUDA 148 (**1.7×**), vs naive Triton 317 (3.6×).
+
+Profiling (torch.profiler + ncu, large):
+
+| | value |
+|---|---|
+| kernels/step | **4** (3 `_stage` + 1 `_final`) + 1 one-time DtoD clone |
+| time/step | ~9.1 ms (`_stage` 2.09 ms ×3 + `_final` 2.54 ms) |
+| ncu `_stage` | DRAM 46.9 %, Memory 64.0 %, Compute(SM) 42.7 %, 2.33 ms |
+
+Observation:
+- **88 ms, beats torch.compile by 2.4× and naive CUDA by 1.7×** — the win over Inductor is the 4-kernels/step fusion (no separate intermediate temporaries) + L2-cached reuse of the shifted loads.
+- **But still ~2.3× over the per-stage roofline** (~1 ms: read field+u, write k+us ≈ 3.4 GB), and `_stage` only reaches **47 % DRAM** (not bandwidth-saturated). The remaining inefficiency: the **z-direction taps (z±1..4) are re-read ~9× across z-programs** (no reuse along z), plus 25-load latency / masking overhead. The x/y reuse is from L2; the z reuse is missing.
+
+Hypothesis / next (Entry 3, CUDA): **2.5D blocking** — a 2D (x,y) tile in shared memory, march along z keeping the 9 z-planes (z−4..z+4) in registers so **each plane is loaded from HBM once** (kills the z-redundancy), compute the in-plane taps from shared memory. Should push `_stage` from 2.33 ms toward ~1 ms → roughly halve total toward the ~21 ms roofline. Plus `-fmad` control for 1e-6.
