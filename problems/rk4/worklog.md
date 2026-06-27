@@ -146,3 +146,35 @@ Performance: **85.5 ms** (my timing) — **ties the Triton Entry 2 (88 ms)** and
 Observation: naive CUDA ≈ Triton because both read the 25 taps from global with L2 caching and neither reuses the z-direction — same ~2.3× over roofline, same ~47% DRAM. **No win over Entry 2 yet** (kept Triton as best). This is the baseline the 2.5D kernel must beat.
 
 Next (Entry 4): **2.5D blocking** — shared-memory (x,y) tile + register queue marching in z, so each plane is read once. Target: cut `_stage` toward ~1 ms / total toward the ~21 ms roofline.
+
+---
+
+### Entry 4 — CUDA 2.5D blocking (shared-mem tile + register z-march) — SLOWER, kept naive
+
+Date: 2026-06-27
+
+Thinking: the textbook fast 3D stencil — a 2D (x,y) tile in shared memory, march along z with a 9-deep register queue (z−4..z+4) so each plane's center is loaded once (kills z-redundancy). Boundary handled by initializing all output buffers to `u0` once (Dirichlet boundary is constant) → marching kernels write interior-only, no per-step clones.
+
+Code version: `versions/v4_cuda_25d.py` (z-chunked variant). Block (BX=32,BY=8); `__shared__ float sm[BY+8][BX+8]`; per-thread `float q[9]`.
+
+Correctness: **pass at 1e-6** (max abs diff 4.77e-7).
+
+Performance — **SLOWER than naive**:
+
+| variant | time |
+|---------|------|
+| naive CUDA (E3) | 85 ms |
+| Triton (E2) | 88 ms |
+| 2.5D, march all z (1 block/(x,y)-tile) | **150 ms** |
+| 2.5D + z-chunking (ZC=32) | **134 ms** |
+
+Profiling (ncu, the march kernel): **Achieved Occupancy 12.5 %** (theoretical 50 %), **DRAM 0.8 %, Compute 4 %** — the GPU is ~96 % idle; top stall is the `__syncthreads` barrier.
+
+Observation — why the textbook technique LOST:
+1. **Halo-overlap redundancy.** The shared-load reads a `(BX+8)×(BY+8)` tile+halo per z-step; for 32×8 that's `(40×16)/(32×8) = 2.5×` the field per stage — the in-plane redundancy *negates* the z-reuse. Bigger tiles cut it (64×16 → 1.7×) but cost shared mem / registers (occupancy ↓). Inescapable for radius-4.
+2. **Sync + serialization.** 2 `__syncthreads`/z-step, and (non-chunked) only ~1425 long-running blocks → low occupancy, GPU starved. z-chunking helped (150→134) by adding blocks, but not enough.
+3. **The big-L2 effect.** H100 has a **50 MB L2**; the naive kernel's 25 neighbor reads are *already* largely served from L2 (the reuse 2.5D does by hand happens automatically), **without** the halo-overlap waste or the barriers. So naive (216M threads, massive latency hiding, L2 reuse) beats hand 2.5D.
+
+Conclusion: **kept naive CUDA / Triton (~85–88 ms) as best.** This is a genuine modern-GPU lesson — the classic shared-memory 2.5D stencil blocking (a win on older small-cache GPUs) can *lose* to a naive massively-parallel kernel on a large-L2 GPU, because L2 already provides the reuse and the explicit tiling only adds halo redundancy + barrier overhead. (Echoes Entry 2's finding that occupancy/parallelism, not manual reuse, was the lever.)
+
+Lessons: (1) Don't assume the textbook optimization wins — measure. 2.5D blocking was the "obvious" answer and it was 1.6–1.8× *slower*. (2) On big-L2 GPUs, a naive massively-parallel stencil is hard to beat; manual shared-mem tiling fights the cache rather than helping it. (3) ncu's occupancy + DRAM% immediately showed the 2.5D was starved (12.5 % occ, <1 % DRAM), not reuse-limited.
