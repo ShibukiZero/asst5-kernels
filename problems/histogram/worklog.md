@@ -433,7 +433,139 @@ Profiler at the best point (`hist_kernel`):
 
 Observation — bottleneck has migrated to the **L1TEX / shared-memory pipe (91.6%)**: the 537 M shared `atomicAdd`s + global loads now saturate that pipe. This is the *first* time a real resource is saturated (v3/v4 were latency-bound with nothing saturated). DRAM at 40.7% ⇒ ~60% bandwidth is unusable because the shared-atomic counting work gates it. The L1TEX cost was always there (inherent to "one atomic per element"); earlier bottlenecks (L2, load latency) masked it until they were cleared.
 
-Conclusion — **STOP here.** Higher occupancy / more grid tuning won't help: the limiter is a saturated pipe doing the algorithm's intrinsic work, not lack of warps. Beating it needs *fewer* shared atomics (warp-aggregation — ineffective here since a warp spans 32 distinct channels, or a sort/reduce-based count) — an algorithmic change with low ROI.
+Conclusion (at the time) — **STOP here.** Higher occupancy / more grid tuning won't help: the limiter is a saturated pipe doing the algorithm's intrinsic work, not lack of warps. Beating it needs *fewer* shared atomics (warp-aggregation — ineffective here since a warp spans 32 distinct channels, or a sort/reduce-based count) — an algorithmic change with low ROI.
+
+> **Superseded by Entry 9.** The "L1TEX is a hard wall" call was half right: L1TEX
+> *was* saturated (91.6%), but that pipe carries **both** global loads **and** shared
+> atomics. The load half was reducible after all — a *vectorized* load (1 uint16 = 2
+> channels) halves the load transactions through L1TEX. Entry 9 does exactly that
+> (without the occupancy crash of Entry 7) and beats 0.343 → **0.297 ms**.
+
+---
+
+### Entry 9 — CH=64 + uint16 vectorized load + lane-major conflict-free shared — WIN
+
+Date: 2026-06-28
+
+Thinking (consensus synthesis): the L1TEX-bound state (Entry 8, 91.6%) is load+atomic
+traffic combined. Two levers, applied together:
+1. **Vectorized load that preserves the warp shape.** Entry 7 proved vectorization
+   helps the load (`long_scoreboard` 6.01→4.72) but crashed occupancy (92.7%→35.5%)
+   because it used 4 ch/thread → 8 threads in x → 128-thread blocks. Instead keep
+   `threadIdx.x = 0..31` and let each lane read **one uint16 = 2 consecutive channels**
+   (`CH=64`), so the block stays `(32,32)` = 1024 threads → occupancy holds. Halves the
+   load transactions through L1TEX and doubles bytes/request (64 B/warp vs 32 B).
+2. **Lane-major conflict-free shared layout.** A naive vectorized version raises shared
+   stalls (Entry 7's `short_scoreboard` 0.95→2.65). Store with `slot = j*32 + lane`:
+   `s[v*CH + j*32 + lane]` ⇒ bank = `(v*64 + j*32 + lane) % 32 = lane` for every j ⇒
+   conflict-free within a warp regardless of the random value v. (This is the *correct*
+   swizzle — unlike Entry 5's 257-padding, which left bank = `(lc+v)%32` still random.)
+   Needs 64 KiB **dynamic** shared (opt-in via `cudaFuncSetAttribute`); 2 blocks/SM fit.
+
+Code version: `versions/v8_ch64_vec2.cu` (CH=64, VEC=2, UNROLL=8, block=(32,32),
+grid=(num_channels/64, 32), 64 KiB dynamic shared, `s[bin*64 + j*32 + lane]`).
+
+Correctness: **pass** (`check: pass`).
+
+Performance:
+- **Runtime: 0.297 ms** (mean of 30, best 0.294) vs same-session Entry 8 baseline
+  **0.342 ms** → **1.15× over Entry 8**, **~173× over baseline**, **~1.86× off the
+  160 µs roofline** (was 2.14×).
+- UNROLL sweep on CH=64 (8/12/16): **flat** — 0.297 / 0.296 / 0.298 ms. Load latency is
+  already largely hidden (`long_scoreboard` 4.22), so deeper unroll buys nothing. Kept
+  UNROLL=8 as canonical.
+
+Profiler (ncu) — Entry 9 vs Entry 8, all success criteria met:
+
+| Metric | Entry 8 | Entry 9 | criterion | |
+|--------|--------:|--------:|-----------|--|
+| Runtime | 0.342 ms | **0.297 ms** | < 0.342 | ✅ −13% |
+| **L1TEX throughput** | **91.6%** | **42.35%** | not worse | ✅ pipe **un-saturated** |
+| DRAM throughput | 40.7% | **46.98%** | > 40.7% | ✅ |
+| L2 throughput | 57.7% | 63.86% | — | up |
+| SM throughput | 64.7% | 68.85% | — | up |
+| Achieved occupancy | 90.4% | **79.05%** | ≥ 75–80% | ✅ (held, vs Entry 7's 35.5%) |
+| stall long_scoreboard | 6.95 | **4.22** | < 6.95 | ✅ |
+| stall mio_throttle (shared-atomic pipe) | 2.56 | **0.55** | not worse | ✅ |
+| stall short_scoreboard (bank/shared) | (0.95; naive-vec→2.65) | **0.68** | not blown up | ✅ lane-major worked |
+
+Observation:
+- **The "intrinsic L1TEX wall" was beatable.** Vectorizing the load dropped L1TEX
+  91.6%→42.35% — i.e. roughly half of that saturation was load-transaction traffic,
+  not shared-atomic work. The pipe is no longer the bottleneck.
+- **The lane-major layout did its job:** `short_scoreboard` stayed at 0.68 instead of
+  blowing up to ~2.65 the way a naive bin-major/uint16 version did in Entry 7. So the
+  two levers are genuinely synergistic — vectorize without the conflict-free layout
+  would have given back much of the win to shared-memory stalls.
+- New state: **nothing saturated again** (L1TEX 42%, DRAM 47%, occ 79%), back to mildly
+  latency-bound (`long_scoreboard` 4.22 is the top stall). DRAM at 47% ⇒ there is still
+  headroom toward the 160 µs roofline.
+
+Method note / who-was-right: in review, two analyses disagreed. (a) "Bottleneck is
+shared-atomic/L1TEX; do a standalone bank-conflict swizzle first" — correctly read the
+91.6% L1TEX as the best kernel's (I had wrongly dismissed it as a mis-attributed Triton
+number), but its #1 standalone-swizzle pick targeted `short_scoreboard` (~0.7) which is
+*not* the limiter. (b) "It's load-latency limited; the occupancy-preserving vectorized
+load is the real lever" — right that Entry 7's vectorize failed only on occupancy.
+The win came from **combining both**: occupancy-preserving vectorized load (lever b) +
+lane-major conflict-free layout (the *useful* form of lever a, folded in for free).
+
+Next step (deferred — needs a decision): **CH=128 + uchar4** would halve load
+transactions again, but needs 128 KiB shared ⇒ ~1 block/SM ⇒ occupancy risk (the same
+trap as Entry 7). Only worth it because CH=64 held occupancy *and* is still load-limited
+(`long_scoreboard` top); abort if occupancy collapses or L1TEX/`mio_throttle` spikes.
+
+---
+
+### Entry 10 — CH=128 + uint32 (uchar4) vectorized load — WIN (despite 50% occupancy)
+
+Date: 2026-06-28
+
+Thinking: push Entry 9 one more notch — each lane reads ONE uint32 = **4 consecutive
+channels** (`CH=128`, `VEC=4`), 4× fewer load instructions than the byte version, 128 B
+/warp/instr. Same lane-major conflict-free layout (`bank = lane` still holds for VEC=4).
+Known risk: 128 KiB dynamic shared ⇒ only 1 block/SM ⇒ occupancy capped ~50%.
+
+Code version: `versions/v9_ch128_vec4.cu` (CH=128, VEC=4, UNROLL=8, block=(32,32),
+grid=(num_channels/128, 32), 128 KiB dynamic shared, `s[bin*128 + j*32 + lane]`).
+
+Correctness: **pass**.
+
+Performance:
+- **Runtime: 0.270 ms** (mean of 4, best 0.270) vs Entry 9 0.297 ms → **1.10× over
+  Entry 9**, **~190× over baseline**, **~1.69× off the 160 µs roofline**.
+
+Profiler (ncu) — Entry 10 vs Entry 9:
+
+| Metric | Entry 9 | Entry 10 | |
+|--------|--------:|---------:|--|
+| Runtime | 0.297 ms | **0.270 ms** | ✅ −9% |
+| **Achieved occupancy** | 79.05% | **49.91%** | ⚠️ dropped to ~50% (1 block/SM, 128 KiB shared) — *as predicted* |
+| DRAM throughput | 46.98% | **53.94%** | ✅ climbing toward bandwidth |
+| L1TEX throughput | 42.35% | 41.82% | flat — not the wall |
+| L2 / SM throughput | 63.86 / 68.85% | 65.27 / 66.37% | — |
+| stall long_scoreboard | 4.22 | **2.69** | ✅ 4× fewer loads → latency better hidden |
+| stall mio_throttle | 0.55 | 0.01 | shared-atomic pipe idle |
+| stall short_scoreboard | 0.68 | 1.02 | up slightly (more atomics/thread); lane-major still holding |
+
+Observation:
+- **The predicted occupancy trap did NOT bite.** Occupancy halved to 49.9% (1 block/SM),
+  yet the kernel got *faster*, because it was never occupancy-starved: UNROLL=8 × 4
+  loads-in-flight supplies enough ILP to hide the load latency on its own
+  (`long_scoreboard` actually *fell* 4.22→2.69, since there are 4× fewer load
+  instructions to wait on). Occupancy is a means (latency hiding); ILP substituted for it.
+- **DRAM throughput climbed 47%→54%** — the kernel is now the closest it has been to
+  bandwidth-bound. This is the end of the vectorize-the-load line: `CH=256` (uint64,
+  8 ch/lane) would need 256 KiB shared > 228 KiB/SM, so it won't fit.
+- Final state: DRAM 54%, occupancy capped at 50% by the 128 KiB histogram, top stall
+  `long_scoreboard` 2.69 (small). The residual gap to 160 µs is the occupancy cap (can't
+  hide latency further) plus the intrinsic shared-atomic work — closing it needs an
+  algorithmic change (fewer atomics per element), not more launch/layout tuning.
+
+Conclusion: **0.270 ms is the practical floor of the one-atomic-per-element form.** Three
+levers compounded from Entry 8's 0.343 ms: uint16 vec load (0.297), then uint32 vec load
+(0.270), each un-saturating a pipe and lowering load-stall, with the lane-major layout
+keeping bank conflicts negligible throughout. ~190× over baseline, 1.69× off roofline.
 
 ---
 
@@ -449,14 +581,25 @@ Conclusion — **STOP here.** Higher occupancy / more grid tuning won't help: th
 | Entry 5 bank-conflict padding | 0.813 ms | 63× | (failed: no effect) |
 | Entry 6 row-unroll ×8 | 0.359 ms | 143× | global-load latency (MLP) |
 | Entry 7 vectorized int loads | 0.400 ms | 128× | (failed: occupancy crash) |
-| **Entry 8 grid/block tuning** | **0.343 ms** | **~150×** | flush-atomic count (launch config) |
+| Entry 8 grid/block tuning | 0.343 ms | ~150× | flush-atomic count (launch config) |
+| Entry 9 CH=64 uint16 vec load + lane-major shared | 0.297 ms | ~173× | un-saturated L1TEX (halved load transactions, conflict-free) |
+| **Entry 10 CH=128 uint32 vec load + lane-major shared** | **0.270 ms** | **~190×** | DRAM 54% (4× fewer loads); won at 50% occupancy via ILP |
 
 (Entry 2 is a side branch — best-effort Triton, not on the CUDA optimization
 line. Its three variants: A global-atomics 11.0 ms, B one-hot privatize 629 ms,
-C `tl.histogram` 4.107 ms. Best Triton ≈ 4.1 ms, ~12× behind the CUDA best.)
+C `tl.histogram` 4.107 ms. Best Triton ≈ 4.1 ms, ~15× behind the CUDA best.)
 
-**Final: 0.343 ms, ~150× over baseline, ~2.1× off the 160 µs read roofline** (code: `versions/v7_grid_tuned.cu`).
+**Final: 0.270 ms, ~190× over baseline, ~1.69× off the 160 µs read roofline** (code: `versions/v9_ch128_vec4.cu`).
 
-Why stop: the kernel is now **L1TEX/shared-memory-pipe bound** (91.6%) on the 537 M shared atomics — the intrinsic cost of counting. DRAM is only ~41%, so it's no longer memory-bound; the read roofline is unreachable because counting, not reading, now dominates. Remaining gains need an algorithmic change (fewer atomics), which is low-ROI.
+Where it stands: Entry 8's "L1TEX wall (91.6%) is intrinsic, STOP" call was beatable.
+That pipe carried both global loads and shared atomics; warp-shape-preserving vectorized
+loads halved then quartered the load transactions — **uint16 (Entry 9, 0.297 ms)** then
+**uint32 (Entry 10, 0.270 ms)** — un-saturating L1TEX (91.6%→42%) and pushing DRAM
+40.7%→54%, while a **lane-major conflict-free** shared layout kept bank conflicts
+negligible throughout (and ILP from UNROLL=8 covered the drop to 50% occupancy at CH=128).
+This is the practical floor of the one-atomic-per-element form (CH=256 won't fit shared).
+The residual ~1.7× to the 160 µs roofline is the occupancy cap + intrinsic atomic work;
+closing it needs an algorithmic change (**fewer shared atomics** per element), not more
+launch/layout tuning.
 
 Key lessons recorded along the way: (1) strided column access over-fetches ~64×; read once, coalesced. (2) a physical transpose just relocates the over-fetch. (3) when nothing is saturated, read **warp stall reasons** before naming a bottleneck — guessing cost two wrong calls (bank conflicts, "shared-atomic throughput"). (4) padding only fixes bank conflicts for correlated writes, not random data. (5) occupancy is a means (latency hiding) with diminishing returns — 90%+ occupancy didn't prevent being latency-bound; ILP (unroll) fixed it. (6) optimization migrates the bottleneck until you hit an intrinsic resource limit. (7) Triton (Entry 2) has no cheap privatized scatter — without user-managed shared memory it tops out ~12× behind hand CUDA on histogram: global atomics hit the L2 wall, one-hot privatization is a 256× compute disaster, and the built-in `tl.histogram` is fast but forces strided per-channel reads. Pick the tool to the access pattern: histogram's scatter wants explicit SRAM, which is CUDA's turf.

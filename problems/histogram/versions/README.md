@@ -19,7 +19,9 @@ code `v(N-1)`.
 | `v4_bankconflict_padding.cu` | 5 | 0.813 ms | ❌ padding: no effect |
 | `v5a_row_unroll.cu` | 6 | 0.359 ms | unroll hides load latency |
 | `v6_vectorized_int.cu` | 7 | 0.400 ms | ❌ vectorize: occupancy crash |
-| **`v7_grid_tuned.cu`** | 8 | **0.343 ms** | ✅ BEST overall — tuned launch (CH=32, by=32, gy=32) |
+| `v7_grid_tuned.cu` | 8 | 0.343 ms | tuned launch (CH=32, by=32, gy=32) |
+| `v8_ch64_vec2.cu` | 9 | 0.297 ms | CH=64 + uint16 vec load (occupancy-preserving) + lane-major conflict-free shared; L1TEX 91.6%→42% |
+| **`v9_ch128_vec4.cu`** | 10 | **0.270 ms** | ✅ BEST overall — CH=128 + uint32 (uchar4) vec load + lane-major shared; DRAM→54%, won at 50% occupancy via ILP |
 
 To run a CUDA version: copy it to `../submission.cu`, then
 `python ../wrap_cuda_submission.py local` and `./run.sh histogram <mode>`.
