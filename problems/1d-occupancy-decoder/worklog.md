@@ -150,7 +150,7 @@ Performance:
 Observation:
 - The entire 18.8->5.35 ms win came from removing CPU-side per-call Module
   construction + 14 serialized `.copy_()` launches that were starving the GPU.
-  The math is unchanged. We are now at the real GPU floor for this op sequence.
+  The math is unchanged. The kernel is now at the real GPU floor for this op sequence.
 - Remaining GPU time is dominated by **SDPA 2.14 ms (40% now)**, then the three
   768x768 GEMMs (~1.48 ms), LayerNorm 0.78 ms + its fp32 casts 0.37 ms (1.15 ms
   of mem-bound glue), head-reshape contiguous 0.62 ms, SiLU 0.25 ms.
@@ -247,7 +247,7 @@ launches and the .ncu-rep ballooned (>65 MB, still climbing) before timing out.
 (Also learned: a backgrounded ssh `ncu` is not killed by stopping the local task;
 the remote ncu reparents to init and must be `pkill`ed on the VM. And `pkill -f
 "eval.py"` in a one-liner matches its own remote shell — verify with `pgrep -xc ncu`.)
-torch.profiler kernel names give the needed evidence directly, so we use those:
+torch.profiler kernel names give the needed evidence directly, so those are used here:
 
 max-autotune variant (4.318 ms self-sum):
 | kernel | ms/iter | % |
@@ -387,8 +387,8 @@ ncu of the best FA-3 (coop 128x128x64), grid (1954,1,12)x(384):
 | **achieved occupancy** | **13.6%** | 24.7% |
 | IPC | 0.53 | 0.58 |
 
-Observation - **even real FA-3 LOSES to cudnn here (0.85x at best), and loses to my
-own hand Triton too.** This is the opposite of the flashattention problem, where FA-3
+Observation - **even real FA-3 LOSES to cudnn here (0.85x at best), and loses to the
+Entry-4 hand Triton too.** This is the opposite of the flashattention problem, where FA-3
 tied cudnn. The cause is the lopsided shape: **kv_len=1024 is tiny** (only 8-16 N-tiles
 per q-tile). FA-3's whole advantage is a deep warp-specialized producer/consumer TMA
 pipeline that amortizes over a LONG kv loop; with kv this short the pipeline can't fill,

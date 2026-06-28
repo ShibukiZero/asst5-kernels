@@ -503,12 +503,13 @@ Observation:
 
 Method note / who-was-right: in review, two analyses disagreed. (a) "Bottleneck is
 shared-atomic/L1TEX; do a standalone bank-conflict swizzle first" — correctly read the
-91.6% L1TEX as the best kernel's (I had wrongly dismissed it as a mis-attributed Triton
-number), but its #1 standalone-swizzle pick targeted `short_scoreboard` (~0.7) which is
-*not* the limiter. (b) "It's load-latency limited; the occupancy-preserving vectorized
-load is the real lever" — right that Entry 7's vectorize failed only on occupancy.
-The win came from **combining both**: occupancy-preserving vectorized load (lever b) +
-lane-major conflict-free layout (the *useful* form of lever a, folded in for free).
+91.6% L1TEX as the best kernel's (an earlier read had wrongly dismissed it as a
+mis-attributed Triton number), but its #1 standalone-swizzle pick targeted
+`short_scoreboard` (~0.7) which is *not* the limiter. (b) "It's load-latency limited; the
+occupancy-preserving vectorized load is the real lever" — right that Entry 7's vectorize
+failed only on occupancy. The win came from **combining both**: occupancy-preserving
+vectorized load (lever b) + lane-major conflict-free layout (the *useful* form of lever a,
+folded in for free).
 
 Next step (deferred — needs a decision): **CH=128 + uchar4** would halve load
 transactions again, but needs 128 KiB shared ⇒ ~1 block/SM ⇒ occupancy risk (the same

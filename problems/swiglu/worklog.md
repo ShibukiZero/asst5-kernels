@@ -335,11 +335,11 @@ Observations:
   `torch::empty` cheap; the ~150 µs gap is **launch + Python dispatch overhead**, not
   allocation. Prealloc is necessary groundwork for graphs (static addresses), not a win
   by itself.
-- **The custom fused epilogue matters, but only because of a trap I hit first.** My first
-  7b used an *eager* epilogue (`F.silu(gate+b)*(value+c)` + `out.copy_`) ≈ 5 kernels, each
-  streaming the full 256 MB tensor → **2.612 ms (worse!)**. Replacing it with one float4
+- **The custom fused epilogue matters, but only because of a trap encountered first.** The
+  initial 7b used an *eager* epilogue (`F.silu(gate+b)*(value+c)` + `out.copy_`) ≈ 5 kernels,
+  each streaming the full 256 MB tensor → **2.612 ms (worse!)**. Replacing it with one float4
   fused kernel (0.256 ms ≈ Inductor's 0.253 ms) fixed it. Lesson: inside a hand-built
-  path you must keep the epilogue fused — don't let it explode into elementwise ops.
+  path the epilogue must stay fused — don't let it explode into elementwise ops.
 - **CUDA Graph delivered the real win: 1.910 (direct) → 1.820 (graph) = −90 µs**, landing
   wall ≈ the GPU-kernel sum (1.810). The graph collapses the CUTLASS-gate + cuBLAS-value
   + epilogue launches into one replay. **cuBLAS under graph capture did NOT degrade** here
