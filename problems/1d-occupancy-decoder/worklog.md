@@ -268,3 +268,58 @@ Hypothesis (the real remaining frontier):
   Everything cheap has been harvested; this is the only remaining lever.
 
 Next step: Entry 4 - SDPA via CUTLASS FA-3 (or hand Triton flash for huge-Q/tiny-KV).
+
+### Entry 4 - hand Triton flash attention for the SDPA (tile-strategy sweep) - LOSES to cudnn
+
+Date: 2026-06-28
+
+Goal: replace the cudnn SDPA (the dominant kernel) with a hand Triton FA-2 tuned
+for this lopsided shape (q_len 250k, kv_len 1024, 12 heads, hd 64, no mask). Isolated
+attention micro-benchmark (just Q,K,V -> attn out), correctness vs `F.sdpa` (maxerr).
+
+Code version: `versions/v4_triton_flash.py` (best config), sweep scripts
+`tmp/decoder_flash_sweep*.py`. Grid = (ceil(LQ/BM), B*H); each program does BM queries
+for one (b,h), loops over kv in BN chunks with online softmax, fp32 accumulate.
+
+Sweep results (isolated attention; cudnn SDPA = ~1.79-1.81 ms on this shape):
+
+Gen 1 (plain FA-2, scale-after-dot, full N-masking) - 48 configs BMx{64,128,256}:
+- best **2.466 ms = 0.72x cudnn** at BM=128 BN=64 nw=8 ns=3. All configs lose.
+- BN=256 with few warps blows up (register spill: 256x256x4w = 43 ms).
+
+Gen 2 (+exp2 softmax, +drop N-mask since LKV%BN==0) - same tile grid:
+- best **2.017 ms = 0.90x cudnn** at BM=128 BN=64 nw=8 ns=4. exp2+no-mask lifted
+  0.72x -> 0.90x. Still 10% slower than cudnn. Correctness maxerr ~2e-4 (tol 5e-2).
+- Pattern: BM=128, BN=64, nw=8 is the sweet spot; BN>=256 spills shared memory
+  (out of resource at ns=4), nw=8 hurts small BM=64 tiles.
+
+`warp_specialize=True` (the Hopper feature cudnn/FA-3 win with): **hard LLVM crash**
+"unsupported load type for producer commit" - it requires TMA / block-pointer
+(`make_block_ptr`) loads, not the raw pointer-arithmetic loads here. Process-level
+abort (uncatchable), so it must be excluded from the sweep. Enabling it = a full
+rewrite to tensor-descriptor loads.
+
+ncu of the best Triton flash (BM=128 BN=64 nw=8 ns=4), grid (1954,12)x(256):
+
+| metric | value |
+|--------|------:|
+| sm__throughput (SM%) | 57.9% |
+| compute-mem throughput | 51.1% |
+| **achieved occupancy** | **24.7%** |
+| IPC | 0.58 inst/cycle |
+
+Observation:
+- **Hand Triton flash LOSES: 0.90x cudnn at best**, exactly as the README warned
+  (CA's hand Triton cross-attn port was 0.81x). The ncu tells why: **24.7% occupancy,
+  0.58 IPC** - BM=128 + 8 warps eats registers/shared mem, capping occupancy, so the
+  kernel can't hide latency. cudnn's wgmma + warp-specialized + TMA pipeline keeps the
+  tensor cores fed at far higher effective utilization. Plain pointer-load Triton FA-2
+  simply can't express that scheme (warp_specialize crashes without TMA loads).
+- Same architectural ceiling found on the flashattention problem: Triton FA-2 ~52% SM
+  vs CUTLASS FA-3 / cudnn ~76%. The last ~10-25% is Hopper warp-spec/TMA, not tiling.
+
+Decision: **do NOT adopt.** Keep cudnn SDPA. Submission stays Entry 2 (4.070 ms).
+The only paths that could *match* (not clearly beat) cudnn are CUTLASS FA-3 (example 88,
+which merely TIED cudnn on the flashattention problem) or a TMA/warp-specialized Triton
+rewrite (block pointers). High effort for an expected tie -> low value. Entry 2 stands
+as the practical optimum (4.6x over baseline).
