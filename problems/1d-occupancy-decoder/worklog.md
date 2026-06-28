@@ -10,6 +10,32 @@ Key workload:
 - Output: `[batch_size, num_queries, 1]`
 - Main benchmark case: `batch_size=1; num_queries=250000; num_latents=1024; width=768; num_heads=12; q_in_dim=3`
 
+## Summary of Results
+
+Env: Nebius H100 80GB, torch 2.12.1+cu130, triton 3.7.1. CUDA-event benchmark, L2
+cleared each run, tol rtol=atol=1e-2. (README's reference machine reports the PyTorch
+path at 7.4 ms; ours is a different stack — all speedups below are vs OUR baseline.)
+
+| Entry | Approach | Runtime | vs baseline | Verdict |
+|------:|----------|--------:|:-----------:|---------|
+| 0 | PyTorch reference (rebuilds nn.Module each call) | 18.789 ms | 1.00x | baseline |
+| 1 | Functional forward (no Module rebuild) | ~5.35 ms | 3.5x | ✅ kept the framework win |
+| **2** | **torch.compile (default Inductor)** | **4.070 ms** | **4.6x** | ✅ **BEST — current submission** |
+| 3 | compile mode sweep: max-autotune / cudagraphs | 4.667 / 4.079 ms | — | ✗ max-autotune LOSES (swaps cuBLAS GEMM); cudagraphs WASH |
+| 4 | hand Triton flash for SDPA (tile sweep) | 0.90x cudnn (attn) | — | ✗ loses to cudnn (24.7% occ) |
+| 5 | CUTLASS FA-3 for SDPA (warp-spec FMHA) | 0.85x cudnn (attn) | — | ✗ loses to cudnn (kv too short → 13.6% occ) |
+
+**Bottom line:** the whole win is structural, not numeric-kernel work — removing the
+per-call nn.Module construction (3.5x) and letting Inductor fuse the elementwise glue
+(another 1.31x). The GEMMs (cuBLAS) and the SDPA (cudnn flash) are already at the vendor
+floor: hand Triton flash (0.90x), CUTLASS FA-3 (0.85x), and Inductor max-autotune all
+LOSE. SDPA stays the largest single kernel (~43%) and is the unrelievable wall for this
+huge-Q (250k) / tiny-KV (1024) shape — FA-3's warp-spec pipeline can't fill on kv=1024,
+so cudnn's shape-aware heuristic wins. **Practical optimum = Entry 2, 4.070 ms (4.6x).**
+
+`submission.py` = Entry 2 (`versions/v2_compile.py`). Every entry has profiling
+(ncu for 0/1/2/4/5, torch.profiler for 3). Code for each entry in `versions/`.
+
 ## Optimization Entries
 
 Append one entry per meaningful experiment.
