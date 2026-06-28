@@ -204,12 +204,41 @@ Results (100 runs each):
 
 Correctness: both pass (1e-2).
 
+Profiling (torch.profiler, CUDA self-time, ms/iter over 10 iters; ncu skipped for
+this discarded negative result — torch.profiler kernel names give the evidence
+directly and don't need the multi-minute per-kernel counter replay):
+
+max-autotune variant (4.318 ms self-sum):
+| kernel | ms/iter | % |
+|--------|--------:|--:|
+| cudnn flash sdpa | 1.74 | 40.3 |
+| **`triton_tem_fused_addmm_silu_t_view`** | **1.74** | **40.2** |
+| triton layernorm+casts | 0.26 | 5.9 |
+| triton silu | 0.25 | 5.9 |
+| nvjet (one small GEMM survived) | 0.16 | 3.7 |
+| triton_tem addmm+layernorm | 0.14 | 3.1 |
+
+reduce-overhead / cudagraphs variant (4.427 ms self-sum):
+| kernel | ms/iter | % |
+|--------|--------:|--:|
+| cudnn flash sdpa | 2.14 | 48.4 |
+| nvjet 192x208 (3 big GEMMs, aggregated) | 1.60 | 36.1 |
+| triton silu | 0.25 | 5.8 |
+| triton layernorm+casts | 0.25 | 5.7 |
+| nvjet out_proj | 0.14 | 3.1 |
+| nvjet c_k/c_v | 0.01 | 0.3 |
+
 Observation:
-- **max-autotune LOST.** The autotuner replaced the cuBLAS `nvjet` GEMMs with its own
-  Triton `mm` templates (e.g. `triton_mm_120` 0.185 ms at 73%). For these large-M
-  (250k-row) 768x768 fp16 GEMMs, cuBLAS beats Inductor's Triton templates, so swapping
-  them in cost ~0.6 ms. (Same lesson as rk4/swiglu: vendor libraries win on the
-  bread-and-butter GEMM shapes; don't let autotune override them.)
+- **max-autotune LOST — direct kernel evidence.** The autotuner replaced a big cuBLAS
+  GEMM with a fused Triton template `triton_tem_fused_addmm_silu_t_view` that costs
+  **1.74 ms** — as large as the whole SDPA, ~3.5x the ~0.49 ms the cuBLAS nvjet took.
+  Only one small nvjet GEMM survived. For these large-M (250k-row) 768x768 fp16 GEMMs,
+  cuBLAS crushes Inductor's Triton templates. (Same lesson as rk4/swiglu: vendor
+  libraries win on bread-and-butter GEMM shapes; don't let autotune override them.)
+- **cudagraphs = WASH — confirmed.** reduce-overhead's kernel set is identical to
+  Entry 2 default: SDPA + three nvjet GEMMs (the 192x208 line aggregates all three
+  at 1.60 ms) + the same fused silu/layernorm triton kernels. No fusion change, so the
+  only possible gain was launch latency — negligible against the big kernels.
 - **cudagraphs was a WASH.** The forward is dominated by big kernels (SDPA 2.17 ms,
   three ~0.5 ms GEMMs); per-launch latency is negligible against those. The
   4.07 < isolated-sum 5.07 gap came from warm-L2 reuse + kernel overlap, not launch
