@@ -323,3 +323,54 @@ The only paths that could *match* (not clearly beat) cudnn are CUTLASS FA-3 (exa
 which merely TIED cudnn on the flashattention problem) or a TMA/warp-specialized Triton
 rewrite (block pointers). High effort for an expected tie -> low value. Entry 2 stands
 as the practical optimum (4.6x over baseline).
+
+### Entry 5 - CUTLASS FA-3 (real Hopper warp-spec FMHA) for the SDPA - LOSES to cudnn
+
+Date: 2026-06-28
+
+Goal: the "do it properly" attempt - replace SDPA with CUTLASS FA-3 (example 88
+FmhaBuilder, the warp-specialized + TMA + wgmma kernel that TIED cudnn on the
+flashattention problem). Adapted from `flashattention/versions/v3_cutlass_fa3.py`:
+head_dim 128 -> 64 (TileShape K-mode = _64; example 88 `run_fwd_64` shapes), and
+**separate Q vs K/V strides** since q_len(250k) != kv_len(1024). Non-causal ->
+DefaultFusion. Built via load_inline (needs `/usr/local/cuda/bin` on PATH).
+
+Code version: `versions/v5_cutlass_fa3.py`. Isolated attention vs `F.sdpa`, maxerr.
+
+Variant sweep (isolated attention; cudnn SDPA = ~1.77-1.80 ms on this shape):
+
+| schedule + TileShape (M,N,D) | time | vs cudnn | correctness |
+|------------------------------|-----:|---------:|-------------|
+| WarpSpec **Cooperative** 128x64x64 | 2.359 ms | 0.76x | maxerr 2.4e-4 |
+| WarpSpec **Pingpong** 128x64x64 | 2.158 ms | 0.83x | 2.4e-4 |
+| WarpSpec **Cooperative** 128x128x64 (best FA-3) | 2.084 ms | 0.85x | 2.4e-4 |
+| (hand Triton best, Entry 4) | 2.017 ms | 0.90x | 2e-4 |
+| **cudnn SDPA** | **~1.78 ms** | **1.00x** | — |
+
+ncu of the best FA-3 (coop 128x128x64), grid (1954,1,12)x(384):
+
+| metric | FA-3 coop | (Triton, Entry 4) |
+|--------|----------:|------------------:|
+| sm__throughput (SM%) | 52.3% | 57.9% |
+| compute-mem throughput | 28.4% | 51.1% |
+| **achieved occupancy** | **13.6%** | 24.7% |
+| IPC | 0.53 | 0.58 |
+
+Observation - **even real FA-3 LOSES to cudnn here (0.85x at best), and loses to my
+own hand Triton too.** This is the opposite of the flashattention problem, where FA-3
+tied cudnn. The cause is the lopsided shape: **kv_len=1024 is tiny** (only 8-16 N-tiles
+per q-tile). FA-3's whole advantage is a deep warp-specialized producer/consumer TMA
+pipeline that amortizes over a LONG kv loop; with kv this short the pipeline can't fill,
+the producer warpgroup starves, and **occupancy collapses to 13.6%** (worse than the
+plain Triton's 24.7%, far below what's needed to hide latency). The more sophisticated
+the kernel, the more its pipeline overhead dominates when there isn't enough kv work to
+pipeline. cudnn evidently dispatches a kernel matched to short-kv and wins.
+
+Lesson: warp-spec/TMA flash is the right tool for balanced or long-kv attention, NOT for
+the huge-Q / tiny-KV decode-style shape. Vendor cudnn's shape-aware heuristic beats a
+single hand-picked FA-3 tile here.
+
+Decision: **do NOT adopt.** cudnn SDPA is the floor for this attention; nothing tried
+(Triton 0.90x, FA-3 0.85x) beats it. **Submission stays Entry 2 (torch.compile, 4.070 ms,
+4.6x over baseline) - the confirmed practical optimum for this problem.** The SDPA
+frontier is closed: it is a vendor-library wall, like the L2 wall in rk4.

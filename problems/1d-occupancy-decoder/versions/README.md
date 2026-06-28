@@ -11,3 +11,4 @@ step in `../worklog.md`. Benchmark: B=1, 250k queries, 1024 latents, width 768,
 | `v2_compile.py` | 2 | 4.070 ms | torch.compile (inductor, fullgraph). Fused head-reshape (-620us) + LayerNorm/casts (1143→251us) + in_layer. **4.6×**. SDPA (2.17ms, cudnn) now 43% |
 | `v3_compile_modes.py` | 3 | 4.667 ms (max-autotune) | mode sweep: max-autotune LOSS (+15%, replaces cuBLAS GEMM w/ slower triton); reduce-overhead/cudagraphs WASH (4.079). Keep default (Entry 2) |
 | `v4_triton_flash.py` | 4 | 2.017 ms attn (0.90× cudnn) | hand Triton FA-2 for SDPA, tile sweep. exp2+no-mask best=BM128/BN64/8w/4s. LOSES to cudnn (24.7% occ, 0.58 IPC); warp_specialize needs TMA. NOT adopted |
+| `v5_cutlass_fa3.py` | 5 | 2.084 ms attn (0.85× cudnn) | CUTLASS FA-3 (example 88, warp-spec FMHA), head_dim 64. Swept coop/pingpong×tile. LOSES to cudnn (kv too short→13.6% occ) and to Triton. NOT adopted |
