@@ -274,3 +274,77 @@ Profiling (ncu, large) — pingpong vs the Entry-4 cooperative kernel:
 Conclusion: **nothing beat cooperative 128×128; kept Entry 4 (12.79 ms).** Pingpong looked marginally faster in a quick `perf_counter` loop (14.18 vs coop 14.36) and has identical ncu SoL, but the **authoritative harness** (with `clear_l2_cache` + 100 runs) exposed it as *worse* and high-variance (14.64 ms mean). The 128×256 tiles can't initialize for D=128 on this problem (register/shmem limit). cuDNN parity (12.79 ms, ~58 % MFU) stands as the ceiling — the vendor is matched, not beaten.
 
 Lessons: (1) **Trust the harness measurement, not quick loops** — without `clear_l2_cache` + enough iters, pingpong looked best but was actually worse + noisy. (2) cuDNN's default config (cooperative-ish) is already optimal for this shape; the easy knobs don't beat it. (3) Beating cuDNN would need something cuDNN doesn't do for fp16 (e.g. FP8 — but that fails the fp16 1e-2 tolerance) — diminishing returns; matched is the right place to stop.
+
+---
+
+### Entry 6 — cached / slim CUTLASS FA-3 — WASH (no win over the FP16 floor)
+
+Date: 2026-06-28
+
+Hypothesis (review): the gap to SDPA (12.79 CUTLASS vs 12.76 SDPA) is ~30 µs of per-call
+wrapper overhead (allocate O/LSE/workspace, can_implement, initialize) that the CUDA-event
+timing might catch as a GPU-idle gap. Cache it (per shape+ptrs) so the hot path is just
+`op.run`. Also fix the `device_id=0` hardcode.
+
+Code version: `versions/v4_fa3_cached.py` (static `std::map` cache of O/LSE/workspace +
+initialized `Operation`; hybrid: small/medium → SDPA, large → cached FA-3).
+
+Same-session baseline (large case 4×64×8192×128, the only benchmarked shape):
+
+| variant | mean | best | std |
+|---------|-----:|-----:|----:|
+| SDPA (v1) | 12.78–12.79 ms | 12.744 ms | 0.025 |
+| CUTLASS FA-3 (v3) | 12.78 ms | 12.759 ms | 0.015 |
+| **cached FA-3 (v4)** | 12.78–12.82 ms | 12.762 ms | — |
+
+Result: **WASH.** SDPA, uncached CUTLASS, and cached CUTLASS are **statistically identical
+(~12.78 ms)**. The "12.79 vs 12.76" was within run-to-run noise, NOT wrapper overhead — so
+the alloc/init does not meaningfully enter the CUDA-event timed region, and caching it buys
+nothing. Correctness passes (math unchanged). There is no FP16 wrapper headroom to harvest.
+
+### Entry 7 — FP8 (e4m3) CUTLASS FA-3 — numerically VIABLE, but BLOCKED by a CUTLASS build wall
+
+Date: 2026-06-28
+
+Goal: change the roofline with Hopper FP8 tensor cores (~2× FP16). The prior Entry-4 note
+guessed "FP8 fails the 1e-2 tolerance" — **this turned out to be wrong**, and worth the check.
+
+Correctness (de-risked FIRST in PyTorch, before any kernel build): the output is tiny
+(**mean|O| = 0.0145, max 0.19**), so atol=1e-2 is ~0.7× the mean output — huge absolute
+headroom. A faithful FP8 simulation (e4m3 cast of Q/K/V, **per-row P scaling** before the
+P→fp8 cast as a real FP8 FMHA does, fp8 O output, V_SCALE dequant):
+
+| scheme | maxdiff | violations |
+|--------|--------:|-----------:|
+| naive (P cast to fp8 with NO scaling) | 0.082 | **52.7%** (P≈1/8192 underflows e4m3) |
+| Q/K fp8, P/V fp32 | 0.0064 | 0% |
+| full fp8 + per-row P-scale, fp8 O out, V_SCALE 1…64 | **0.0090** | **0%** |
+
+So **FP8 is numerically viable** (maxdiff ~0.009 < atol 0.01, 0 violations) — *provided* the
+kernel does the internal per-row P scaling (which a real FA-3 FP8 impl does). V_SCALE turned
+out unnecessary (1–64 identical); the dominant error is the QK/PV fp8 math, not the O cast.
+Caveat: this relies on the benchmark's **random-normal inputs (no outliers)** — FP8 has no
+headroom for heavy-tailed real-LLM activations. (Honest scope note.)
+
+Build: **FAILS.** Swapping `Element = cutlass::float_e4m3_t` into the `FmhaBuilder` (tried
+TileShape 128×256×128 and 128×128×128) routes the QK mainloop to
+`MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInput`, and `StageCountAutoCarveout` hands it a
+plain `StageCount<5>` that "has no member bytes" → *"Could not find a mainloop
+specialization."* The bundled `cutlass_library` source's `FmhaBuilder` has no working direct
+FP8 path; example 88's FP8 goes through its full `FwdRunner` + `#define FP8` machinery
+(different stage-count / mainloop wiring). Reproducing that is a ~200-line port (or a CUTLASS
+header patch) — beyond the 2-entry budget for a borderline-correctness (0.009 vs 0.01),
+speed-unverified payoff.
+
+Decision: **neither entry beats the FP16 floor.** Submission stays at the FP16 vendor floor
+**(~12.76 ms; `v3_cutlass_fa3.py`, cuDNN-parity)**. Honest standing: FP16 attention here is
+a hard vendor wall (SDPA = CUTLASS = cached, all 12.78). FP8 is the only real lever and is
+*numerically* in-budget (refuting the earlier guess), but the CUTLASS FP8 FMHA does not
+build via the direct builder in this environment — the win is gated by a toolchain wall, not
+by math or by tolerance.
+
+Lessons: (1) Re-test inherited "it won't work" claims — FP8 *does* pass 1e-2 here (the prior
+guess was wrong); de-risk correctness in a 20-line sim before building. (2) The small-P
+underflow (52.7% → 0%) shows FP8 attention REQUIRES per-row P scaling — naive P→fp8 is
+catastrophic. (3) A real win can be blocked by toolchain (builder/version) rather than
+algorithm; know when that wall is past the budget and stop honestly.
