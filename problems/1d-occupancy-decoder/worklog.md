@@ -204,9 +204,19 @@ Results (100 runs each):
 
 Correctness: both pass (1e-2).
 
-Profiling (torch.profiler, CUDA self-time, ms/iter over 10 iters; ncu skipped for
-this discarded negative result — torch.profiler kernel names give the evidence
-directly and don't need the multi-minute per-kernel counter replay):
+Profiling (torch.profiler, CUDA self-time, ms/iter over 10 iters).
+
+Note on ncu for max-autotune (tried, abandoned): the idea was "warm the inductor
+autotune cache outside ncu, then ncu only replays the final fixed kernels." It does
+NOT work with this eval.py: `run_profiling` launches ncu around a fresh one-shot
+subprocess (`python -c ...`) that calls `custom_kernel` exactly once with no warmup,
+and that subprocess did not reuse the warm inductor FX/autotune cache cross-process
+-> it re-autotuned *under* ncu, so ncu instrumented all the GEMM trial-kernel
+launches and the .ncu-rep ballooned (>65 MB, still climbing) before timing out.
+(Also learned: a backgrounded ssh `ncu` is not killed by stopping the local task;
+the remote ncu reparents to init and must be `pkill`ed on the VM. And `pkill -f
+"eval.py"` in a one-liner matches its own remote shell — verify with `pgrep -xc ncu`.)
+torch.profiler kernel names give the needed evidence directly, so we use those:
 
 max-autotune variant (4.318 ms self-sum):
 | kernel | ms/iter | % |
