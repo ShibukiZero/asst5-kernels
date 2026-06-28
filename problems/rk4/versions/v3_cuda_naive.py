@@ -5,11 +5,16 @@
 # Each thread = one (z,y,x) point; 4 kernels/step (3 stage + 1 final). No shared-memory
 # reuse yet -> still ~2.3x over roofline (z-neighbors re-read). 2.5D blocking is Entry 4.
 import os
+import sys
 import torch
 from torch.utils.cpp_extension import load_inline
 from task import input_t, output_t
 
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0")
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 
 _CPP = "#include <ATen/cuda/CUDAContext.h>\ntorch::Tensor rk4(torch::Tensor u0, double a, double hx, double hy, double hz, int n);\n"
 _CUDA = r"""

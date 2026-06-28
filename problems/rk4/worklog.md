@@ -223,3 +223,127 @@ Conclusion: **kept naive CUDA (85 ms) as the practical optimum.** This is the th
 Answer to "what's the bottleneck": **L2 bandwidth (90 %)** for the naive — but it's a *balanced* L2-bound-at-high-occupancy kernel. The only way to cut L2 traffic (block/register reuse) sacrifices the parallelism that hides latency, so naive is the sweet spot. **~85 ms (16.6× over baseline) stands as the best.**
 
 Lessons: (1) "Theoretical headroom" (DRAM 50 %) ≠ reachable — the techniques to claim it have side effects (parallelism loss) that dominate. (2) For a latency-bound memory kernel, **occupancy/parallelism is the currency**; trading it for locality is a net loss on a big-L2 GPU. (3) Three independent optimizations (2.5D, coarsening, and earlier the Triton tile sweep) all converged on the same conclusion — naive massive parallelism wins. Knowing when to stop optimizing is itself the result.
+
+---
+
+### Entry 6 — Naive CUDA++: warp-shuffle x-reuse + launch cleanup — marginal win (2.8%)
+
+Date: 2026-06-28
+
+Context (review consensus): the prior "naive is the optimum" conclusion was reached vs
+Entry 4/5 which both **traded occupancy for locality**. A review proposed attacks that cut
+L2 traffic while **keeping one-thread-per-point and high occupancy** — the opposite mistake
+to avoid. Entry 6 is the low-risk first step.
+
+Change (Entry 3 dataflow untouched — same 4 kernels/step, same RK4, one thread/point):
+1. **x-neighbor taps via `__shfl`** within the warp (lanes are contiguous in x) instead of
+   L2/global re-loads; cross-warp-edge lanes fall back to global. Shuffles issued
+   UNCONDITIONALLY before the interior branch so all active lanes participate (correctness);
+   a boundary lane's `uc` is exactly the field value its interior neighbour needs, so any
+   same-warp source lane is valid → the only fallback is `lane < d`.
+2. **TPB swept** (multiple of 32, cuts x-padding): 128/160/192/256.
+3. **32-bit indexing** (600^3 = 216M < 2^31).
+
+Code version: `versions/v6_cuda_xshfl.py` (TPB via `RK4_TPB` env / `-DTPB`).
+(Note: also restored the `sys.stdout is None` guard that the v3/v6 version files were
+missing — without it the harness spawn-worker dies on `load_inline` with
+`'NoneType' has no attribute 'flush'`.)
+
+Correctness: **pass (1e-6)** at every TPB — the shuffle boundary logic is right.
+
+Performance (same-session Entry 3 baseline **85.466 ms**):
+
+| TPB | runtime |
+|-----|--------:|
+| 128 | 83.719 ms |
+| **160** | **83.087 ms** ✅ |
+| 192 | 83.658 ms |
+| 256 | 83.328 ms |
+
+Best **83.087 ms (TPB=160) — −2.4 ms / 2.8% over Entry 3.**
+
+Profiling (ncu, stage_k, TPB=160) vs Entry 3 — the decisive mechanism check:
+
+| metric | Entry 3 | Entry 6 |
+|--------|--------:|--------:|
+| **L2 (lts) throughput** | 90.4% | **97.18%** ↑ |
+| DRAM throughput | 50.1% | 52.6% |
+| SM throughput | 66.3% | 59.9% ↓ |
+| achieved occupancy | 80.2% | 83.6% |
+
+Observation — **the x-shuffle did NOT relieve L2; L2 went UP to 97%.** This confirms the
+pre-registered prediction: x is the **contiguous / best-coalesced** direction, so its
+neighbour loads were already served cheaply by L1 — they were never the L2 bottleneck.
+The 2.8% win is **efficiency, not traffic reduction**: removing x-load *instructions*
+(shuffle) and x-padding (TPB=160) lets the kernel run closer to the L2 bandwidth wall,
+which is now even more saturated (97%). The real L2 traffic is the **y (stride 600) and z
+(stride 360k) strided loads**, untouched here.
+
+Implication for Entry 7: to actually cut L2 traffic you must attack **y** (and x), which is
+exactly what a per-z-plane shared-memory x/y tile does. L2 at 97% is a clear bottleneck to
+relieve *if* shared tiling reduces transactions without an occupancy/barrier penalty.
+
+Decision: keep Entry 6 (83.087 ms) as a small but real step; the prize is Entry 7.
+
+---
+
+### Entry 7 — per-z-plane shared-memory x/y tile (no z-march) — LOSES (but cuts L2!)
+
+Date: 2026-06-28
+
+Thinking: Entry 6 showed L2 at 97% (driven by y/z strided loads, not x). Attack **y** with
+a per-z-plane shared tile, while fixing Entry 4's actual death cause: NO z-march (one
+z-plane/block, one thread/point, one `__syncthreads`, block count stays ~hundreds of
+thousands → occupancy preserved). Shared tile holds the (BX+8)×(BY+8) plane neighbourhood;
+x/y stencil from SRAM, z's 8 taps still from global. Same Entry-3 dataflow.
+
+Code version: `versions/v7_plane_tile.py` (BX,BY via `RK4_BX`/`RK4_BY` / `-D`).
+
+Correctness: **pass (1e-6)** at every tile config.
+
+Performance — **all configs SLOWER than Entry 3/6**:
+
+| tile (BX×BY) | runtime |
+|--------------|--------:|
+| 32×16 | 89.583 ms (best tile) |
+| 32×8 | 93.072 ms |
+| 64×8 | 95.656 ms |
+| 128×4 | 98.132 ms |
+| 64×16 | 103.981 ms |
+
+Profiling (ncu, stage_k, BX=32 BY=16) — the **decisive** numbers:
+
+| metric | Entry 3 | Entry 6 | **Entry 7 (32×16)** |
+|--------|--------:|--------:|--------------------:|
+| runtime | 85.5 ms | 83.1 ms | 89.6 ms |
+| **L2 (lts) throughput** | 90.4% | 97.2% | **62.3%** ↓↓ |
+| DRAM throughput | 50.1% | 52.6% | 43.6% |
+| SM throughput | 66.3% | 59.9% | 65.3% |
+| **achieved occupancy** | 80.2% | 83.6% | **83.9%** (held) |
+| barrier stall /issue | — | — | 1.81 |
+
+Observation — **the mechanism WORKED, and that makes the loss the strongest possible
+result.** The shared tile did exactly what it was supposed to: **L2 dropped 97% → 62%**,
+and occupancy was **preserved (83.9%, even above Entry 3)** — both consensus success
+criteria met. Yet the kernel is **slower**. With nothing saturated (L2 62%, DRAM 44%,
+SM 65%), it is now **latency-bound**: the `__syncthreads` splits the kernel into a
+tile-load phase and a compute phase, which **collapses the memory-level parallelism** that
+the naive form thrives on. Naive issues ~25 *independent* global loads per thread that all
+overlap and hide each other's latency; the tiled form serialises a load-phase behind a
+barrier, leaving far fewer in-flight loads to hide the (still-global) z latency.
+
+**This refutes the review's hypothesis** that Entry 4/5 lost *only* because of occupancy.
+Entry 7 **held occupancy AND cut L2 traffic** and still lost — so the real currency is
+**MLP / latency-hiding**, and *any* shared-tile + barrier structure inherently reduces it.
+On the big-L2 H100, the naive massive-MLP form genuinely is optimal: the L2 "wall" (90-97%)
+is the *symptom* of a kernel pushing hard with maximal overlap, not a throughput limit that
+locality can productively relieve — relieving it costs more in latency-hiding than it saves.
+
+Decision: **do NOT adopt Entry 7.** New best = **Entry 6 (83.087 ms, TPB=160 x-shuffle +
+launch cleanup)** — a small (2.8%) but real efficiency win, with the same one-thread-
+per-point massive-MLP structure intact. Submission = `versions/v6_cuda_xshfl.py`.
+
+Final standing: **83.1 ms (TPB=160), ~17× over baseline.** Three more locality attempts
+(2.5D z-march, x-coarsening, and now occupancy-preserving plane-tile) have all lost to
+naive parallelism — the plane-tile most instructively, by succeeding at its stated goal
+(L2↓, occupancy held) yet still losing on latency-hiding. The case is now closed.
