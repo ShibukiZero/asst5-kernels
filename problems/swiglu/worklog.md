@@ -274,3 +274,94 @@ Why it's a wash (traffic analysis): the plain gate GEMM writes only `gate` (256 
 Conclusion: **kept Entry 5 (1.954 ms) as best.** The EVT is correct and is real CUTLASS skill (custom visitor tree + source-tensor trick + nested args), but it doesn't beat Entry 5. The only fusion that would genuinely help is a **single dual-GEMM** computing both `gate` and `value` in one kernel (eliminating *both* materializations, writing only `out`) — but that needs CUTLASS for `value` too (→ the BOTH-cutlass correctness case, 1–3 elem off, guard-dependent) and a custom dual-accumulator mainloop (much harder). Not pursued.
 
 Lessons: (1) **"DRAM headroom" from whole-kernel ncu averages does not mean an epilogue add-on is free** — the epilogue phase has its own (memory-bound) profile; reason about the *phase*, not the kernel average. (2) Fusing only helps if it removes traffic that *wasn't already hidden*; here it traded a hidden `gate` write for an unhidden `value` read. (3) The CUTLASS EVT mechanics (SrcFetch-as-aux trick, RowBroadcast, nested args) now work end-to-end — reusable for problems where the fused factor is *computed in the same kernel* (then it's a real win).
+
+---
+
+### Entry 7 — H2 engineering: fused custom epilogue + CUDA Graph — BEATS Entry 5 ✅
+
+Date: 2026-06-28
+
+Context (review consensus): a proposed "Entry 8" wanted both-CUTLASS + a cached
+*correction mask* (`bad_val = out_ref[bad_idx]`, patched into the timed path). **Rejected
+and not implemented** — that caches the *reference's output values* at the few positions
+both-CUTLASS gets wrong (Entry 4/5: 1–3 / 67M, irreducible since the reference IS
+cuBLAS-TF32 and CUTLASS-value differs by rounding amplified by unbounded `silu(g)`), i.e.
+it memorizes the answer for the specific benchmark input rather than computing SwiGLU.
+That's distinct from Entry 5's guard (which only *selects* a fully-correct path, never
+injects reference values). Consensus: spend both entries on the **legitimate H2
+engineering line** instead. (Nuance accepted: "value must be cuBLAS" is an engineering
+fact under this assignment's cuBLAS-self-referential test, not a theorem.)
+
+Same numerics as Entry 5 (H2: CUTLASS gate + cuBLAS value); only the surrounding
+engineering changes. Targets the Entry-5 gap: GPU-kernel sum ≈1.80 ms vs wall 1.954 ms.
+
+Same-session Entry 5 baseline re-measured: **1.958 ms**.
+
+| step | what | runtime |
+|------|------|--------:|
+| **7a** `v7a_h2_prealloc.py` | out-GEMM (`cutlass_gemm_out`+`cutlass_ws`) + cached gate/value/wsp/Wt buffers, `torch.mm(out=)`, direct fast path; Inductor epilogue | **1.948 ms** |
+| 7b-direct (fused epilogue, no graph) | replace Inductor epilogue with a custom **float4 fused** `swiglu_ep_kernel` (`silu(gate+b)*(value+c)`, one kernel) | **1.910 ms** |
+| **7b-graph** `v7b_h2_graph.py` | 7b-direct captured as a **CUDA Graph** (replay the whole H2 fast path) | **1.820 ms** ✅ |
+
+Correctness: **pass**, and **6/6 seeds** (8846,1,42,1234,9999,77) pass on both the first
+call and the graph **replay** (mode=graph each), maxdiff ≈0.10 on large-magnitude
+elements (covered by rtol) — identical to H2.
+
+Profiling (torch.profiler, 7b direct path, 20 calls):
+
+| kernel | time | % |
+|--------|-----:|--:|
+| cuBLAS value GEMM (`sm90 tf32 nn`) | 0.817 ms | 45.2 |
+| CUTLASS gate GEMM (`GemmUniversal`) | 0.735 ms | 40.6 |
+| fused `swiglu_ep_kernel` (custom) | 0.256 ms | 14.1 |
+| **GPU kernel sum** | **1.810 ms** | |
+
+ncu (SpeedOfLight) of the three fast-path kernels (durations replay-inflated vs the
+torch.profiler times above):
+
+| kernel | SM% | DRAM% | occupancy | ncu dur |
+|--------|----:|------:|----------:|--------:|
+| CUTLASS gate GEMM | 87.4% | 34.5% | 14.1% | 832 µs |
+| cuBLAS value GEMM | 73.0% | 26.9% | 18.5% | 987 µs |
+| **custom `swiglu_ep_kernel`** | 55.0% | **92.0%** | 83.3% | 256 µs |
+
+- GEMMs match Entry 4/5 (CUTLASS gate 87% SM vs cuBLAS value 73% SM — the gate wins on
+  utilization). The custom float4 epilogue is **92% DRAM-bound** — at the memory roofline,
+  same as Entry 5's Inductor epilogue → it can only be *eliminated* (fused into a GEMM),
+  not sped up, and Entry 6 already showed that fusion is a wash here.
+
+Observations:
+- **7a (prealloc alone) barely moved (1.958→1.948).** The caching allocator makes
+  `torch::empty` cheap; the ~150 µs gap is **launch + Python dispatch overhead**, not
+  allocation. Prealloc is necessary groundwork for graphs (static addresses), not a win
+  by itself.
+- **The custom fused epilogue matters, but only because of a trap I hit first.** My first
+  7b used an *eager* epilogue (`F.silu(gate+b)*(value+c)` + `out.copy_`) ≈ 5 kernels, each
+  streaming the full 256 MB tensor → **2.612 ms (worse!)**. Replacing it with one float4
+  fused kernel (0.256 ms ≈ Inductor's 0.253 ms) fixed it. Lesson: inside a hand-built
+  path you must keep the epilogue fused — don't let it explode into elementwise ops.
+- **CUDA Graph delivered the real win: 1.910 (direct) → 1.820 (graph) = −90 µs**, landing
+  wall ≈ the GPU-kernel sum (1.810). The graph collapses the CUTLASS-gate + cuBLAS-value
+  + epilogue launches into one replay. **cuBLAS under graph capture did NOT degrade** here
+  (the earlier 2.612 was purely the un-fused epilogue). For capturability: CUTLASS
+  `initialize`+`run` take the current stream; capture on a side stream after a 3-iter
+  warmup; static buffers; `try/except` falls back to a direct path if capture ever fails.
+
+Submission rule applied: 7b-graph 1.820 < 7a 1.948 − 0.020 and correctness stable ⇒
+**submit 7b (`v7b_h2_graph.py`).**
+
+Conclusion: **Entry 7b (1.820 ms) is the new best — 1.958 → 1.820 ms (~7%, −138 µs over
+Entry 5), ~1.07× over Entry 2's 2.036 ms.** The win is purely legitimate engineering on
+the proven H2 numerics: a one-kernel fused epilogue + a CUDA Graph that removes the
+launch/dispatch overhead, bringing the wall down to the GPU-kernel floor. No numerics
+changed, no reference values cached — the fast path fully computes SwiGLU and is correct
+across seeds (re-validated + re-captured per unique input via the data_ptr guard).
+
+Lessons: (1) When GPU-sum ≪ wall, the gap is **launch/dispatch** — a CUDA Graph (not
+prealloc) is the lever; prealloc only enables it. (2) In a hand-built fast path, keep the
+epilogue **fused into one kernel** — an eager rewrite silently multiplies memory traffic
+(here 0.25 ms → ~0.9 ms, turning a win into a 2.6 ms loss). (3) cuBLAS *can* be captured
+without slowdown when the rest of the graph is sound — verify by isolating direct vs graph.
+(4) The rejected both-CUTLASS-patch is the boundary between optimization and benchmark
+memorization: a legitimate fast path must compute the right answer for an unseen input
+*without* having first seen that input's reference.
